@@ -28,6 +28,7 @@ ENV_EXCLUDED = {
 
 EXCLUDED_FILE = Path("excluded_contracts.json")
 UI_SETTINGS_FILE = Path("ui_settings.json")
+PROFILE_FILE = Path("profile_settings.json")
 
 DEFAULT_UI_SETTINGS = {
     "domain": "1wujym.life",
@@ -35,8 +36,17 @@ DEFAULT_UI_SETTINGS = {
     "battery": 76,
 }
 
-# Кэш последней разобранной выписки в памяти (по user_id)
+DEFAULT_PROFILE = {
+    "name": "",
+    "dob": "",
+    "country": "Россия",
+    "phone": "",
+    "email": "",
+}
+
+# Кэш последней разобранной выписки и состояние ввода данных профиля (по user_id)
 LAST_TRANSFERS: dict[int, list[dict]] = {}
+WAITING_PROFILE: set[int] = set()
 
 PHONE_RE = re.compile(
     r"(?:\+?7|8)[\s\-\(\)]*\d{3}[\s\-\(\)]*\d{3}[\s\-\(\)]*\d{2}[\s\-\(\)]*\d{2}"
@@ -91,6 +101,25 @@ def save_ui_settings(settings: dict) -> None:
     )
 
 
+def load_profile() -> dict:
+    profile = dict(DEFAULT_PROFILE)
+    if PROFILE_FILE.exists():
+        try:
+            data = json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                profile.update(data)
+        except Exception:
+            pass
+    return profile
+
+
+def save_profile(profile: dict) -> None:
+    PROFILE_FILE.write_text(
+        json.dumps(profile, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def is_allowed_user(user: types.User | None) -> bool:
     if ALLOWED_USER_ID == 0:
         return True
@@ -98,6 +127,54 @@ def is_allowed_user(user: types.User | None) -> bool:
 
 
 # ---------------- РАЗБОР PDF Т-БАНКА ----------------
+
+def extract_client_name(first_page_text: str) -> str:
+    """Извлекает ФИО клиента из шапки PDF-выписки Т-Банка."""
+    stop_words = (
+        "справка",
+        "акционерное",
+        "тбанк",
+        "россия",
+        "адрес",
+        "паспорт",
+        "продукт",
+        "договор",
+        "движение",
+        "уважением",
+        "руководитель",
+        "москва",
+        "область",
+        "улица",
+        "выдан",
+        "серия",
+        "номер",
+        "дата",
+        "подразделения",
+        "операции",
+        "сумма",
+    )
+    name_re = re.compile(r"^[А-ЯЁ][а-яё\-]+(?:\s+[А-ЯЁ][а-яё\-]+){1,2}$")
+    for raw_line in first_page_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "движение средств" in line.lower():
+            break
+        line = re.split(
+            r"\s+(?:АКЦИОНЕРНОЕ|РОССИЯ,|ТЕЛ\.:|АО\s+«ТБанк»)",
+            line,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip()
+        if not line:
+            continue
+        low = line.lower()
+        if any(sw in low for sw in stop_words):
+            continue
+        if name_re.fullmatch(line):
+            return line
+    return ""
+
 
 def strip_own_card(desc: str) -> tuple[str, str]:
     protected_spans: list[tuple[int, int]] = []
@@ -185,7 +262,7 @@ def detect_method(desc: str, counterparty_key: str | None) -> str:
 
 def parse_tbank_pdf(
     pdf_bytes: bytes, excluded_contracts: set[str]
-) -> tuple[list[dict], int, int]:
+) -> tuple[list[dict], int, int, str]:
     skip_prefixes = (
         "АКЦИОНЕРНОЕ ОБЩЕСТВО",
         "РОССИЯ,",
@@ -206,9 +283,13 @@ def parse_tbank_pdf(
     stop_markers = ("Пополнения:", "С уважением,")
 
     raw_lines: list[str] = []
+    client_name = ""
+
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
+        for page_idx, page in enumerate(pdf.pages):
             text = page.extract_text() or ""
+            if page_idx == 0:
+                client_name = extract_client_name(text)
             for line in text.splitlines():
                 clean_line = line.strip()
                 if not clean_line:
@@ -361,7 +442,44 @@ def parse_tbank_pdf(
             continue
         results.append(item)
 
-    return results, total_recognized, skipped_repeated
+    return results, total_recognized, skipped_repeated, client_name
+
+
+def parse_profile_input(text: str) -> dict[str, str]:
+    """Разбирает сообщение пользователя на почту, телефон, дату рождения и имя."""
+    parsed: dict[str, str] = {}
+    remaining = text.strip()
+
+    email_m = re.search(
+        r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}",
+        remaining,
+    )
+    if email_m:
+        parsed["email"] = email_m.group(0).strip()
+        remaining = remaining[: email_m.start()] + " " + remaining[email_m.end() :]
+
+    dob_m = re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", remaining)
+    if dob_m:
+        parsed["dob"] = dob_m.group(0)
+        remaining = remaining[: dob_m.start()] + " " + remaining[dob_m.end() :]
+
+    phone_m = re.search(r"\+?\d[\d\s\-\(\)]{7,}\d", remaining)
+    if phone_m:
+        parsed["phone"] = re.sub(r"\s+", " ", phone_m.group(0)).strip()
+        remaining = remaining[: phone_m.start()] + " " + remaining[phone_m.end() :]
+
+    leftover = re.sub(
+        r"\b(?:телефон|тел|почта|email|e-mail|mail|имя|фио|дата\s+рождения|др)\s*[:\-]?",
+        " ",
+        remaining,
+        flags=re.IGNORECASE,
+    )
+    leftover = re.sub(r"[,;|\n\r]+", " ", leftover)
+    leftover = re.sub(r"\s+", " ", leftover).strip()
+    if leftover and re.search(r"[А-Яа-яЁёA-Za-z]", leftover):
+        parsed["name"] = leftover
+
+    return parsed
 
 
 # ---------------- EXCEL ----------------
@@ -677,7 +795,7 @@ def draw_ios_wifi(img: Image.Image, center_x: int, bottom_y: int) -> None:
 
 
 def draw_ios_battery(img: Image.Image, left_x: int, bottom_y: int, battery: int) -> None:
-    """Рисует классическую иконку батареи iOS без цифр процентов."""
+    """Классическая иконка батареи iOS без цифр процентов."""
     scale = 4
     bat_w, bat_h = 72, 36
     cw, ch = 84, 42
@@ -692,7 +810,6 @@ def draw_ios_battery(img: Image.Image, left_x: int, bottom_y: int, battery: int)
     outline_color = (142, 145, 152, 255)
     fill_color = (255, 255, 255, 255) if pct > 20 else (255, 69, 58, 255)
 
-    # Внешний контур корпуса батареи
     x0 = 1 * scale
     y0 = top_pad
     x1 = x0 + bat_w * scale
@@ -704,7 +821,6 @@ def draw_ios_battery(img: Image.Image, left_x: int, bottom_y: int, battery: int)
         width=3 * scale,
     )
 
-    # Внутренняя полоска заряда с аккуратным отступом от контура
     pad = int(5.5 * scale)
     max_fill_w = (x1 - x0) - 2 * pad
     fill_w = max(int(8 * scale), int(max_fill_w * pct / 100))
@@ -714,7 +830,6 @@ def draw_ios_battery(img: Image.Image, left_x: int, bottom_y: int, battery: int)
         fill=fill_color,
     )
 
-    # Контакт-выступ справа (D-форма)
     nub_x0 = x1 + int(3.0 * scale)
     nub_x1 = x1 + int(7.5 * scale)
     nub_h = 13 * scale
@@ -766,6 +881,116 @@ def draw_checkmark(draw: ImageDraw.ImageDraw, x: int, y: int, color=(46, 158, 91
     draw.line([(x, y + 16), (x + 11, y + 27), (x + 30, y + 7)], fill=color, width=6, joint="curve")
 
 
+def draw_verified_badge(size: int = 40) -> Image.Image:
+    """Зелёный кружок с белой галочкой подтверждения."""
+    scale = 4
+    s = size * scale
+    badge = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    d = ImageDraw.Draw(badge, "RGBA")
+    pad = 2 * scale
+    d.ellipse([pad, pad, s - pad, s - pad], fill=(42, 175, 102, 255))
+    d.line(
+        [
+            (int(s * 0.28), int(s * 0.52)),
+            (int(s * 0.44), int(s * 0.67)),
+            (int(s * 0.72), int(s * 0.35)),
+        ],
+        fill=(255, 255, 255, 255),
+        width=int(3.6 * scale),
+        joint="curve",
+    )
+    return badge.resize((size, size), Image.Resampling.LANCZOS)
+
+
+def draw_ru_flag(width: int = 46, height: int = 32) -> Image.Image:
+    """Флаг России со скруглёнными углами."""
+    scale = 4
+    w, h = width * scale, height * scale
+    flag = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(flag)
+    h1 = h // 3
+    h2 = (2 * h) // 3
+    d.rectangle([0, 0, w, h1], fill=(255, 255, 255, 255))
+    d.rectangle([0, h1, w, h2], fill=(28, 87, 184, 255))
+    d.rectangle([0, h2, w, h], fill=(213, 43, 30, 255))
+
+    radius = int(5 * scale)
+    mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=255)
+    flag.putalpha(mask)
+
+    border = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    ImageDraw.Draw(border).rounded_rectangle(
+        [0, 0, w - 1, h - 1],
+        radius=radius,
+        outline=(218, 222, 230, 255),
+        width=2 * scale,
+    )
+    flag = Image.alpha_composite(flag, border)
+    return flag.resize((width, height), Image.Resampling.LANCZOS)
+
+
+def draw_chevron_right(img: Image.Image, right_x: int, center_y: int) -> None:
+    """Тонкая серая стрелка '>' со сглаживанием."""
+    scale = 4
+    w, h = 22, 34
+    layer = Image.new("RGBA", (w * scale, h * scale), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    d.line(
+        [
+            (4 * scale, 4 * scale),
+            (17 * scale, 17 * scale),
+            (4 * scale, 30 * scale),
+        ],
+        fill=(136, 144, 158, 255),
+        width=int(3.2 * scale),
+        joint="curve",
+    )
+    small = layer.resize((w, h), Image.Resampling.LANCZOS)
+    img.paste(small, (right_x - w, int(center_y - h / 2)), small)
+
+
+def get_status_time_str(ui_settings: dict) -> str:
+    status_time = ui_settings.get("status_time", "auto")
+    if status_time == "auto":
+        msk = timezone(timedelta(hours=3))
+        return datetime.now(msk).strftime("%H:%M")
+    return status_time
+
+
+def draw_sheet_header(
+    img: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    W: int,
+    H: int,
+    title: str,
+    ui_settings: dict,
+) -> int:
+    domain = ui_settings.get("domain", "1wujym.life")
+    battery = int(ui_settings.get("battery", 76))
+    status_time = get_status_time_str(ui_settings)
+
+    draw_status_bar(img, draw, W, status_time, battery)
+    draw_browser_bar(draw, W, domain)
+
+    sheet_top = 285
+    draw.rounded_rectangle([0, sheet_top, W, H + 80], radius=64, fill=(255, 255, 255))
+
+    font_back = load_font(45, bold=True)
+    font_title = load_font(72, bold=True)
+
+    bx, by = 62, sheet_top + 64
+    draw.line([(bx + 20, by), (bx, by + 20), (bx + 20, by + 40)], fill=(27, 102, 224), width=6, joint="curve")
+    draw.text((bx + 44, by - 7), "Назад", fill=(27, 102, 224), font=font_back)
+
+    cx, cy = W - 82, sheet_top + 84
+    draw.line([(cx - 19, cy - 19), (cx + 19, cy + 19)], fill=(45, 52, 66), width=5)
+    draw.line([(cx + 19, cy - 19), (cx - 19, cy + 19)], fill=(45, 52, 66), width=5)
+
+    draw.text((54, sheet_top + 172), title, fill=(17, 24, 39), font=font_title)
+    return sheet_top
+
+
 def build_screenshots(
     transfers: list[dict],
     mode: str,
@@ -786,18 +1011,10 @@ def build_screenshots(
         return []
 
     W, H = 1170, 2532
-    domain = ui_settings.get("domain", "1wujym.life")
-    battery = int(ui_settings.get("battery", 76))
-    status_time = ui_settings.get("status_time", "auto")
-    if status_time == "auto":
-        msk = timezone(timedelta(hours=3))
-        status_time = datetime.now(msk).strftime("%H:%M")
 
     sbp_icon = load_icon("sbp", max_w=142, max_h=90)
     card_icon = load_icon("card", max_w=108, max_h=76)
 
-    font_back = load_font(45, bold=True)
-    font_title = load_font(72, bold=True)
     font_tab = load_font(44, bold=True)
     font_row_title = load_font(47, bold=True)
     font_status = load_font(38, bold=False)
@@ -811,22 +1028,7 @@ def build_screenshots(
 
         img = Image.new("RGB", (W, H), (14, 16, 20))
         draw = ImageDraw.Draw(img)
-
-        draw_status_bar(img, draw, W, status_time, battery)
-        draw_browser_bar(draw, W, domain)
-
-        sheet_top = 285
-        draw.rounded_rectangle([0, sheet_top, W, H + 80], radius=64, fill=(255, 255, 255))
-
-        bx, by = 62, sheet_top + 64
-        draw.line([(bx + 20, by), (bx, by + 20), (bx + 20, by + 40)], fill=(27, 102, 224), width=6, joint="curve")
-        draw.text((bx + 44, by - 7), "Назад", fill=(27, 102, 224), font=font_back)
-
-        cx, cy = W - 82, sheet_top + 84
-        draw.line([(cx - 19, cy - 19), (cx + 19, cy + 19)], fill=(45, 52, 66), width=5)
-        draw.line([(cx + 19, cy - 19), (cx - 19, cy + 19)], fill=(45, 52, 66), width=5)
-
-        draw.text((54, sheet_top + 172), "История платежей", fill=(17, 24, 39), font=font_title)
+        sheet_top = draw_sheet_header(img, draw, W, H, "История платежей", ui_settings)
 
         tab_y0, tab_y1 = sheet_top + 308, sheet_top + 436
         tab_x0, tab_x1 = 54, W - 54
@@ -912,6 +1114,178 @@ def build_screenshots(
     return pages
 
 
+def build_profile_screenshot(profile: dict, ui_settings: dict) -> bytes:
+    """Генерирует PNG-скриншот страницы 'Настройки' профиля."""
+    W, H = 1170, 2532
+    img = Image.new("RGB", (W, H), (14, 16, 20))
+    draw = ImageDraw.Draw(img)
+
+    sheet_top = draw_sheet_header(img, draw, W, H, "Настройки", ui_settings)
+
+    font_section = load_font(42, bold=False)
+    font_label = load_font(42, bold=True)
+    font_helper = load_font(34, bold=False)
+
+    text_dark = (17, 24, 39)
+    text_grey = (138, 145, 158)
+    text_blue = (36, 114, 232)
+    card_bg = (245, 246, 249)
+    divider_color = (233, 236, 241)
+
+    badge_icon = draw_verified_badge(40)
+    ru_flag = draw_ru_flag(46, 32)
+
+    card_x0 = 54
+    card_x1 = W - 54
+    card_radius = 36
+
+    def draw_row_content(
+        y_center: int,
+        label: str,
+        value: str = "",
+        verified: bool = False,
+        show_flag: bool = False,
+    ) -> None:
+        # Подпись слева
+        lb = draw.textbbox((0, 0), label, font=font_label)
+        lw, lh = lb[2] - lb[0], lb[3] - lb[1]
+        draw.text(
+            (card_x0 + 44, y_center - lh / 2 - lb[1]),
+            label,
+            fill=text_dark,
+            font=font_label,
+        )
+
+        # Стрелка '>' справа
+        chev_right = card_x1 - 40
+        draw_chevron_right(img, chev_right, y_center)
+        right_cursor = chev_right - 46
+
+        if verified:
+            img.paste(
+                badge_icon,
+                (right_cursor - badge_icon.width, int(y_center - badge_icon.height / 2)),
+                badge_icon,
+            )
+            right_cursor -= badge_icon.width + 20
+
+        if show_flag:
+            img.paste(
+                ru_flag,
+                (right_cursor - ru_flag.width, int(y_center - ru_flag.height / 2)),
+                ru_flag,
+            )
+            right_cursor -= ru_flag.width + 18
+
+        if value:
+            max_val_w = right_cursor - (card_x0 + 44 + lw + 30)
+            val_font_size = 40
+            val_font = load_font(val_font_size, bold=False)
+            vb = draw.textbbox((0, 0), value, font=val_font)
+            while (vb[2] - vb[0]) > max_val_w and val_font_size > 26:
+                val_font_size -= 2
+                val_font = load_font(val_font_size, bold=False)
+                vb = draw.textbbox((0, 0), value, font=val_font)
+            vw, vh = vb[2] - vb[0], vb[3] - vb[1]
+            draw.text(
+                (right_cursor - vw, y_center - vh / 2 - vb[1]),
+                value,
+                fill=text_grey,
+                font=val_font,
+            )
+
+    # --- Блок 1: Основные данные ---
+    sec1_y = sheet_top + 296
+    draw.text((card_x0, sec1_y), "Основные данные", fill=text_grey, font=font_section)
+
+    row_h = 156
+    c1_y0 = sec1_y + 74
+    c1_y1 = c1_y0 + row_h * 3
+    draw.rounded_rectangle([card_x0, c1_y0, card_x1, c1_y1], radius=card_radius, fill=card_bg)
+
+    draw.line(
+        [(card_x0 + 42, c1_y0 + row_h), (card_x1 - 42, c1_y0 + row_h)],
+        fill=divider_color,
+        width=2,
+    )
+    draw.line(
+        [(card_x0 + 42, c1_y0 + row_h * 2), (card_x1 - 42, c1_y0 + row_h * 2)],
+        fill=divider_color,
+        width=2,
+    )
+
+    draw_row_content(c1_y0 + row_h // 2, "Имя", profile.get("name", ""))
+    draw_row_content(c1_y0 + row_h + row_h // 2, "Дата рождения", profile.get("dob", ""))
+    draw_row_content(
+        c1_y0 + row_h * 2 + row_h // 2,
+        "Страна регистрации",
+        profile.get("country", "Россия"),
+        show_flag=True,
+    )
+
+    # --- Блок 2: Контактные данные ---
+    sec2_y = c1_y1 + 82
+    draw.text((card_x0, sec2_y), "Контактные данные", fill=text_grey, font=font_section)
+
+    single_h = 152
+    c2_y0 = sec2_y + 72
+    c2_y1 = c2_y0 + single_h
+    draw.rounded_rectangle([card_x0, c2_y0, card_x1, c2_y1], radius=card_radius, fill=card_bg)
+    draw_row_content(
+        c2_y0 + single_h // 2,
+        "Телефон",
+        profile.get("phone", ""),
+        verified=bool(profile.get("phone")),
+    )
+
+    c3_y0 = c2_y1 + 32
+    c3_y1 = c3_y0 + single_h
+    draw.rounded_rectangle([card_x0, c3_y0, card_x1, c3_y1], radius=card_radius, fill=card_bg)
+    draw_row_content(
+        c3_y0 + single_h // 2,
+        "Почта",
+        profile.get("email", ""),
+        verified=bool(profile.get("email")),
+    )
+
+    # Подпись под контактами (автоподбор размера, чтобы не вылезла за край)
+    h1_part1 = "Для изменения подтвержденных данных "
+    h1_part2 = "свяжитесь с нами"
+    h1_size = 34
+    f_h1 = load_font(h1_size, bold=False)
+    full_w = draw.textbbox((0, 0), h1_part1 + h1_part2, font=f_h1)[2]
+    while full_w > (card_x1 - card_x0) and h1_size > 26:
+        h1_size -= 1
+        f_h1 = load_font(h1_size, bold=False)
+        full_w = draw.textbbox((0, 0), h1_part1 + h1_part2, font=f_h1)[2]
+
+    h1_y = c3_y1 + 36
+    draw.text((card_x0, h1_y), h1_part1, fill=text_grey, font=f_h1)
+    p1_w = draw.textbbox((0, 0), h1_part1, font=f_h1)[2]
+    draw.text((card_x0 + p1_w, h1_y), h1_part2, fill=text_blue, font=f_h1)
+
+    # --- Блок 3: Безопасность ---
+    sec3_y = h1_y + 114
+    draw.text((card_x0, sec3_y), "Безопасность", fill=text_grey, font=font_section)
+
+    c4_y0 = sec3_y + 72
+    c4_y1 = c4_y0 + single_h
+    draw.rounded_rectangle([card_x0, c4_y0, card_x1, c4_y1], radius=card_radius, fill=card_bg)
+    draw_row_content(c4_y0 + single_h // 2, "Пароль")
+
+    h2_y = c4_y1 + 36
+    draw.text(
+        (card_x0, h2_y),
+        "Для изменения нужно ввести текущий пароль",
+        fill=text_grey,
+        font=font_helper,
+    )
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def build_action_keyboard(transfers: list[dict]) -> InlineKeyboardMarkup:
     dep_cnt = sum(1 for t in transfers if t["amount"] < 0)
     wd_cnt = sum(1 for t in transfers if t["amount"] > 0)
@@ -941,7 +1315,31 @@ def build_action_keyboard(transfers: list[dict]) -> InlineKeyboardMarkup:
                 )
             ]
         )
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="Скриншот профиля", callback_data="scr:profile"
+            )
+        ]
+    )
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def profile_prompt_text(profile: dict) -> str:
+    cur_name = profile.get("name") or "не указано"
+    cur_dob = profile.get("dob") or "не указана"
+    return (
+        "Введи **телефон** и **почту** для скриншота профиля "
+        "(одной строкой или с новой строки).\n\n"
+        f"Сейчас в профиле:\n"
+        f"• Имя: `{cur_name}`\n"
+        f"• Дата рождения: `{cur_dob}`\n\n"
+        "Если нужно сразу поменять имя или дату рождения, просто допиши их туда же:\n"
+        "`+79991234567 mail@gmail.com`\n"
+        "или\n"
+        "`+79991234567 mail@gmail.com 15.05.1995 Татьяна Берлева`\n\n"
+        "Для отмены нажми /cancel"
+    )
 
 
 # ---------------- КОМАНДЫ И ОБРАБОТЧИКИ ----------------
@@ -950,6 +1348,8 @@ def build_action_keyboard(transfers: list[dict]) -> InlineKeyboardMarkup:
 async def cmd_start(message: types.Message):
     if not is_allowed_user(message.from_user):
         return
+    if message.from_user:
+        WAITING_PROFILE.discard(message.from_user.id)
     ui = load_ui_settings()
     sbp_p = get_sbp_asset_path()
     f_reg = get_font_asset_path(bold=False)
@@ -967,6 +1367,7 @@ async def cmd_start(message: types.Message):
         f"Настройки скрина: домен `{ui['domain']}`, часы `{ui['status_time']}`, заряд `{ui['battery']}%`\n"
         f"{assets_info}\n\n"
         "Команды:\n"
+        "/profile — сделать скриншот профиля (Настройки)\n"
         "/domain 1wujym.life — сменить домен в строке браузера\n"
         "/status 22:21 76 — задать часы и уровень батареи (или /status auto 65)\n"
         "/excluded — список игнорируемых договоров\n"
@@ -976,10 +1377,31 @@ async def cmd_start(message: types.Message):
     )
 
 
+@dp.message(Command("profile"))
+async def cmd_profile(message: types.Message):
+    if not is_allowed_user(message.from_user):
+        return
+    if message.from_user:
+        WAITING_PROFILE.add(message.from_user.id)
+    profile = load_profile()
+    await message.answer(profile_prompt_text(profile), parse_mode="Markdown")
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: types.Message):
+    if not is_allowed_user(message.from_user):
+        return
+    if message.from_user:
+        WAITING_PROFILE.discard(message.from_user.id)
+    await message.answer("Отменено.")
+
+
 @dp.message(Command("domain"))
 async def cmd_domain(message: types.Message):
     if not is_allowed_user(message.from_user):
         return
+    if message.from_user:
+        WAITING_PROFILE.discard(message.from_user.id)
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
         await message.answer("Формат: /domain 1wujym.life")
@@ -994,6 +1416,8 @@ async def cmd_domain(message: types.Message):
 async def cmd_status(message: types.Message):
     if not is_allowed_user(message.from_user):
         return
+    if message.from_user:
+        WAITING_PROFILE.discard(message.from_user.id)
     parts = (message.text or "").split()
     if len(parts) < 2:
         await message.answer("Формат: /status 22:21 76 (или /status auto 54)")
@@ -1053,6 +1477,8 @@ async def cmd_unexclude(message: types.Message):
 async def handle_pdf(message: types.Message, bot: Bot):
     if not is_allowed_user(message.from_user):
         return
+    if message.from_user:
+        WAITING_PROFILE.discard(message.from_user.id)
 
     doc = message.document
     if not doc or not (doc.file_name or "").lower().endswith(".pdf"):
@@ -1068,9 +1494,14 @@ async def handle_pdf(message: types.Message, bot: Bot):
         pdf_bytes = buf.getvalue()
 
         excluded = load_excluded()
-        transfers, total_recognized, skipped_repeated = parse_tbank_pdf(
+        transfers, total_recognized, skipped_repeated, client_name = parse_tbank_pdf(
             pdf_bytes, excluded
         )
+
+        if client_name:
+            profile = load_profile()
+            profile["name"] = client_name
+            save_profile(profile)
 
         if not transfers:
             await wait_msg.edit_text(
@@ -1119,6 +1550,18 @@ async def handle_pdf(message: types.Message, bot: Bot):
         await wait_msg.edit_text(f"Не удалось разобрать файл: {e}")
 
 
+@dp.callback_query(F.data == "scr:profile")
+async def handle_profile_button(callback: types.CallbackQuery):
+    if not is_allowed_user(callback.from_user):
+        await callback.answer()
+        return
+
+    WAITING_PROFILE.add(callback.from_user.id)
+    profile = load_profile()
+    await callback.answer()
+    await callback.message.answer(profile_prompt_text(profile), parse_mode="Markdown")
+
+
 @dp.callback_query(F.data.startswith("scr:"))
 async def handle_screenshots(callback: types.CallbackQuery):
     if not is_allowed_user(callback.from_user):
@@ -1156,6 +1599,39 @@ async def handle_screenshots(callback: types.CallbackQuery):
     except Exception as e:
         logging.exception("Ошибка генерации PNG")
         await callback.message.answer(f"Ошибка при создании PNG: {e}")
+
+
+@dp.message(F.text)
+async def handle_profile_text(message: types.Message):
+    if not is_allowed_user(message.from_user):
+        return
+    if not message.from_user or message.from_user.id not in WAITING_PROFILE:
+        return
+
+    parsed = parse_profile_input(message.text or "")
+    if not any(k in parsed for k in ("phone", "email", "dob", "name")):
+        await message.answer(
+            "Не удалось распознать телефон или почту. Пришли их в одном сообщении "
+            "(например: `+79991234567 mail@gmail.com`) или нажми /cancel.",
+            parse_mode="Markdown",
+        )
+        return
+
+    profile = load_profile()
+    profile.update(parsed)
+    save_profile(profile)
+    WAITING_PROFILE.discard(message.from_user.id)
+
+    try:
+        ui = load_ui_settings()
+        png_bytes = build_profile_screenshot(profile, ui)
+        await message.answer_photo(
+            BufferedInputFile(png_bytes, filename="profile.png"),
+            caption="Скриншот профиля готов (нажми /profile, если нужно переделать).",
+        )
+    except Exception as e:
+        logging.exception("Ошибка генерации скриншота профиля")
+        await message.answer(f"Ошибка при создании скриншота профиля: {e}")
 
 
 async def main():
