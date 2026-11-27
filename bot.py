@@ -25,6 +25,17 @@ ENV_EXCLUDED = {
 
 EXCLUDED_FILE = Path("excluded_contracts.json")
 
+PHONE_RE = re.compile(
+    r"(?:\+?7|8)[\s\-\(\)]*\d{3}[\s\-\(\)]*\d{3}[\s\-\(\)]*\d{2}[\s\-\(\)]*\d{2}"
+)
+MASKED_CARD_RE = re.compile(
+    r"(?:"
+    r"\b\d{4}[\s\-]?\d{2}[\*•xXхХ]{2}[\s\-]?[\*•xXхХ]{4}[\s\-]?\d{4}\b"
+    r"|\b\d{4,6}[\*•xXхХ]{2,}\d{4}\b"
+    r"|(?<!\d)[\*•xXхХ]{1,4}\s?\d{4}\b(?![\*•xXхХ])"
+    r")"
+)
+
 logging.basicConfig(level=logging.INFO)
 dp = Dispatcher()
 
@@ -52,16 +63,36 @@ def is_allowed(message: types.Message) -> bool:
     return message.from_user is not None and message.from_user.id == ALLOWED_USER_ID
 
 
+def strip_own_card(desc: str) -> tuple[str, str]:
+    """
+    Извлекает и убирает последние 4 цифры своей карты из текста описания,
+    не задевая номера телефонов и маски чужих карт.
+    """
+    protected_spans: list[tuple[int, int]] = []
+    for pattern in (PHONE_RE, MASKED_CARD_RE):
+        for match in pattern.finditer(desc):
+            protected_spans.append(match.span())
+
+    for match in re.finditer(r"(?<![\d+])\b(\d{4})\b(?!\d)", desc):
+        start, end = match.span()
+        if any(p_start < end and start < p_end for p_start, p_end in protected_spans):
+            continue
+        before = desc[:start].lower()
+        if re.search(r"(?:на карту|с карты|номеру карты)\s+$", before):
+            continue
+        cleaned = desc[:start] + " " + desc[end:]
+        return re.sub(r"\s+", " ", cleaned).strip(), match.group(1)
+
+    return re.sub(r"\s+", " ", desc).strip(), ""
+
+
 def extract_counterparty(desc: str) -> tuple[str | None, str]:
     """
     Возвращает (ключ_для_поиска_повторов, читаемое_значение_для_таблицы).
     Если в описании нет номера телефона, договора или карты (например, просто СБП),
     возвращает (None, ""), чтобы такие операции не отсекались как повторы.
     """
-    phone_match = re.search(
-        r"(?:\+?7|8)[\s\-\(\)]*\d{3}[\s\-\(\)]*\d{3}[\s\-\(\)]*\d{2}[\s\-\(\)]*\d{2}",
-        desc,
-    )
+    phone_match = PHONE_RE.search(desc)
     if phone_match:
         digits = re.sub(r"\D", "", phone_match.group(0))
         if len(digits) == 11 and digits.startswith("8"):
@@ -73,20 +104,59 @@ def extract_counterparty(desc: str) -> tuple[str | None, str]:
         num = contract_match.group(1)
         return f"contract:{num}", f"Договор {num}"
 
-    ext_card_match = re.search(r"(?:\d{4,6}\*+\d{4}|\*+\d{4})", desc)
+    ext_card_match = MASKED_CARD_RE.search(desc)
     if ext_card_match:
-        mask = ext_card_match.group(0)
-        return f"card:{mask}", f"Карта {mask}"
+        norm_mask = re.sub(r"[\s\-]+", "", ext_card_match.group(0))
+        norm_mask = re.sub(r"[•xXхХ]", "*", norm_mask)
+        return f"card:{norm_mask}", f"Карта {norm_mask}"
+
+    plain_card_match = re.search(
+        r"(?:на карту|с карты|номеру карты)\s+(\d{4,16})\b",
+        desc,
+        re.IGNORECASE,
+    )
+    if plain_card_match:
+        num = plain_card_match.group(1)
+        return f"card:{num}", f"Карта {num}"
 
     return None, ""
 
 
+def detect_method(desc: str, counterparty_key: str | None) -> str:
+    desc_low = desc.lower()
+    if any(
+        k in desc_low
+        for k in ("сбп", "система быстрых платежей", "номеру телефона")
+    ):
+        return "СБП"
+    if (
+        (counterparty_key and counterparty_key.startswith("card:"))
+        or any(
+            k in desc_low
+            for k in (
+                "карт",
+                "card2card",
+                "c2c",
+                "p2p",
+                "moneysend",
+                "visa direct",
+            )
+        )
+    ):
+        return "По карте"
+    if "договор" in desc_low:
+        return "По договору"
+    return "Перевод"
+
+
 def parse_tbank_pdf(
     pdf_bytes: bytes, excluded_contracts: set[str]
-) -> tuple[list[dict], int]:
+) -> tuple[list[dict], int, int]:
     """
-    Извлекает из PDF-выписки Т-Банка переводы людям и пополнения переводом на карту,
-    полностью удаляя все операции по номерам/договорам/картам, встретившимся > 1 раза.
+    Извлекает из PDF-выписки Т-Банка переводы (СБП, по карте, по договору)
+    и пополнения переводом на карту, полностью удаляя операции по
+    номерам/договорам/картам, встретившимся > 1 раза.
+    Возвращает: (итоговый_список, всего_распознано, отсечено_повторов).
     """
     skip_prefixes = (
         "АКЦИОНЕРНОЕ ОБЩЕСТВО",
@@ -135,6 +205,26 @@ def parse_tbank_pdf(
         r"[+-]\s*\d[\d\s\u00a0]*[.,]\d{2}(?:\s*(?:₽|RUB|USD|EUR|Р|P))?"
     )
 
+    # Признаки карточных переводов/пополнений (работают даже если банк пишет "Оплата ... P2P/C2C")
+    card_transfer_keywords = (
+        "перевод с карты",
+        "перевод на карту",
+        "перевод по номеру карты",
+        "пополнение с карты",
+        "пополнение на карту",
+        "пополнение карты",
+        "пополнение по номеру карты",
+        "зачисление на карту",
+        "с карты на карту",
+        "между картами",
+        "card2card",
+        "c2c",
+        "p2p",
+        "moneysend",
+        "visa direct",
+        "perevod",
+    )
+
     include_keywords = (
         "перевод",
         "система быстрых платежей",
@@ -142,13 +232,12 @@ def parse_tbank_pdf(
         "пополнение",
         "на карту",
         "с карты",
+        "по номеру карты",
         "зачисление",
-        "card2card",
-        "c2c",
+        *card_transfer_keywords,
     )
-    exclude_keywords = (
-        "оплата",
-        "покупка",
+
+    hard_exclude_keywords = (
         "кэшбэк",
         "комиссия",
         "проценты",
@@ -164,7 +253,9 @@ def parse_tbank_pdf(
         "наличн",
         "терминал",
         "возврат",
+        "atm",
     )
+    purchase_exclude_keywords = ("оплата", "покупка")
 
     candidates: list[dict] = []
 
@@ -190,30 +281,33 @@ def parse_tbank_pdf(
         desc = re.sub(r"\b\d{2}:\d{2}\b", " ", desc)
         desc = desc.replace("|", " ")
 
-        card = ""
-        card_match = re.search(r"(?<![\d*+])\b(\d{4})\b(?![\d*])", desc)
-        if card_match:
-            card = card_match.group(1)
-            desc = desc[: card_match.start()] + " " + desc[card_match.end() :]
-
-        desc = re.sub(r"\s+", " ", desc).strip()
+        desc, card = strip_own_card(desc)
         desc_low = desc.lower()
 
-        if any(bad in desc_low for bad in exclude_keywords):
+        if any(bad in desc_low for bad in hard_exclude_keywords):
             continue
         if any(contract in desc for contract in excluded_contracts):
             continue
+
+        is_card_transfer = any(k in desc_low for k in card_transfer_keywords)
+        if not is_card_transfer and any(
+            bad in desc_low for bad in purchase_exclude_keywords
+        ):
+            continue
+
         if not any(good in desc_low for good in include_keywords):
             continue
 
         direction = "Входящий" if amount > 0 else "Исходящий"
         counterparty_key, counterparty_label = extract_counterparty(desc)
+        method = detect_method(desc, counterparty_key)
 
         candidates.append(
             {
                 "date": dates[0],
                 "time": times[0] if times else "",
                 "direction": direction,
+                "method": method,
                 "amount": amount,
                 "counterparty_key": counterparty_key,
                 "counterparty": counterparty_label,
@@ -221,6 +315,8 @@ def parse_tbank_pdf(
                 "card": card,
             }
         )
+
+    total_recognized = len(candidates)
 
     key_counts = Counter(
         item["counterparty_key"]
@@ -238,7 +334,7 @@ def parse_tbank_pdf(
             continue
         results.append(item)
 
-    return results, skipped_repeated
+    return results, total_recognized, skipped_repeated
 
 
 def build_excel(rows: list[dict]) -> bytes:
@@ -251,10 +347,11 @@ def build_excel(rows: list[dict]) -> bytes:
         "Дата",
         "Время",
         "Тип",
+        "Способ",
         "Сумма (₽)",
-        "Номер / Договор",
+        "Номер / Договор / Карта",
         "Описание",
-        "Карта",
+        "Своя карта",
     ]
     ws.append(headers)
 
@@ -270,15 +367,16 @@ def build_excel(rows: list[dict]) -> bytes:
                 row["date"],
                 row["time"],
                 row["direction"],
+                row["method"],
                 row["amount"],
                 row["counterparty"],
                 row["description"],
                 row["card"],
             ]
         )
-        ws.cell(row=ws.max_row, column=4).number_format = "#,##0.00"
+        ws.cell(row=ws.max_row, column=5).number_format = "#,##0.00"
 
-    col_widths = [12, 8, 12, 14, 22, 46, 8]
+    col_widths = [12, 8, 12, 14, 14, 24, 46, 11]
     for i, width in enumerate(col_widths, start=1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = width
 
@@ -292,9 +390,8 @@ async def cmd_start(message: types.Message):
     if not is_allowed(message):
         return
     await message.answer(
-        "Кидай PDF-выписку из Т-Банка — верну Excel только с разовыми "
-        "переводами и пополнениями на карту (повторяющиеся номера полностью "
-        "отсекаются).\n\nКоманды:\n"
+        "Кидай PDF-выписку из Т-Банка — верну Excel с разовыми переводами "
+        "(СБП, по карте, по договору) и пополнениями на карту.\n\nКоманды:\n"
         "/excluded — список игнорируемых договоров\n"
         "/exclude 1234567890 — добавить договор в исключения\n"
         "/unexclude 1234567890 — убрать из исключений"
@@ -357,26 +454,39 @@ async def handle_pdf(message: types.Message, bot: Bot):
         pdf_bytes = buf.getvalue()
 
         excluded = load_excluded()
-        transfers, skipped_repeated = parse_tbank_pdf(pdf_bytes, excluded)
+        transfers, total_recognized, skipped_repeated = parse_tbank_pdf(
+            pdf_bytes, excluded
+        )
 
         if not transfers:
             await wait_msg.edit_text(
-                f"Подходящих разовых переводов не найдено (отсечено повторяющихся: {skipped_repeated})."
+                f"Распознано переводов: {total_recognized}\n"
+                f"Отсечено повторяющихся: {skipped_repeated}\n"
+                "Разовых переводов для таблицы не осталось."
             )
             return
 
-        total_in = sum(t["amount"] for t in transfers if t["amount"] > 0)
-        total_out = sum(t["amount"] for t in transfers if t["amount"] < 0)
+        incoming = [t for t in transfers if t["amount"] > 0]
+        outgoing = [t for t in transfers if t["amount"] < 0]
+
+        total_in = sum(t["amount"] for t in incoming)
+        total_out = sum(t["amount"] for t in outgoing)
         balance = total_in + total_out
+
+        method_counts = Counter(t["method"] for t in transfers)
+        methods_line = ", ".join(
+            f"{name} — {cnt}" for name, cnt in method_counts.most_common()
+        )
 
         excel_bytes = build_excel(transfers)
         out_name = f"transfers_{Path(doc.file_name).stem}.xlsx"
 
         caption = (
-            f"Найдено разовых переводов: {len(transfers)}\n"
-            f"Отсечено повторяющихся операций: {skipped_repeated}\n"
-            f"Входящие: +{total_in:,.2f} ₽\n"
-            f"Исходящие: {total_out:,.2f} ₽\n"
+            f"Распознано переводов (всего): {total_recognized}\n"
+            f"Отсечено повторяющихся: {skipped_repeated}\n"
+            f"В таблице (разовых): {len(transfers)} ({methods_line})\n\n"
+            f"Входящие: {len(incoming)} шт. (+{total_in:,.2f} ₽)\n"
+            f"Исходящие: {len(outgoing)} шт. ({total_out:,.2f} ₽)\n"
             f"Разница: {balance:+,.2f} ₽"
         ).replace(",", " ")
 
