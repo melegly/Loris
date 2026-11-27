@@ -677,56 +677,58 @@ def draw_ios_wifi(img: Image.Image, center_x: int, bottom_y: int) -> None:
 
 
 def draw_ios_battery(img: Image.Image, left_x: int, bottom_y: int, battery: int) -> None:
+    """Рисует классическую иконку батареи iOS без цифр процентов."""
     scale = 4
-    bat_w, bat_h = 74, 37
+    bat_w, bat_h = 72, 36
     cw, ch = 84, 42
     W_s, H_s = cw * scale, ch * scale
-    top_pad = 2 * scale
-    radius = 11 * scale
+    top_pad = 3 * scale
 
     pct = max(5, min(100, int(battery)))
 
-    pill_mask = Image.new("L", (W_s, H_s), 0)
-    ImageDraw.Draw(pill_mask).rounded_rectangle(
-        [0, top_pad, bat_w * scale, top_pad + bat_h * scale],
-        radius=radius,
-        fill=255,
-    )
-
-    fill_layer = Image.new("RGBA", (W_s, H_s), (122, 124, 130, 255))
-    fd = ImageDraw.Draw(fill_layer)
-    fill_w = int(bat_w * scale * pct / 100)
-    fill_color = (255, 255, 255, 255) if pct > 20 else (255, 69, 58, 255)
-    fd.rectangle([0, 0, fill_w, H_s], fill=fill_color)
-
     bat_img = Image.new("RGBA", (W_s, H_s), (0, 0, 0, 0))
-    bat_img.paste(fill_layer, (0, 0), pill_mask)
-
     bd = ImageDraw.Draw(bat_img, "RGBA")
 
-    font_bat = load_font(27 * scale, bold=True)
-    bat_text = str(pct)
-    tb = bd.textbbox((0, 0), bat_text, font=font_bat)
-    tw, th = tb[2] - tb[0], tb[3] - tb[1]
-    txt_color = (14, 16, 20, 255) if pct > 20 else (255, 255, 255, 255)
-    tx = (bat_w * scale - tw) / 2 - tb[0]
-    ty = top_pad + (bat_h * scale - th) / 2 - tb[1]
-    bd.text((tx, ty), bat_text, fill=txt_color, font=font_bat)
+    outline_color = (142, 145, 152, 255)
+    fill_color = (255, 255, 255, 255) if pct > 20 else (255, 69, 58, 255)
 
-    nub_x0 = int((bat_w + 3.0) * scale)
-    nub_x1 = int((bat_w + 7.5) * scale)
+    # Внешний контур корпуса батареи
+    x0 = 1 * scale
+    y0 = top_pad
+    x1 = x0 + bat_w * scale
+    y1 = y0 + bat_h * scale
+    bd.rounded_rectangle(
+        [x0, y0, x1, y1],
+        radius=10 * scale,
+        outline=outline_color,
+        width=3 * scale,
+    )
+
+    # Внутренняя полоска заряда с аккуратным отступом от контура
+    pad = int(5.5 * scale)
+    max_fill_w = (x1 - x0) - 2 * pad
+    fill_w = max(int(8 * scale), int(max_fill_w * pct / 100))
+    bd.rounded_rectangle(
+        [x0 + pad, y0 + pad, x0 + pad + fill_w, y1 - pad],
+        radius=int(5.2 * scale),
+        fill=fill_color,
+    )
+
+    # Контакт-выступ справа (D-форма)
+    nub_x0 = x1 + int(3.0 * scale)
+    nub_x1 = x1 + int(7.5 * scale)
     nub_h = 13 * scale
-    nub_y0 = int(top_pad + (bat_h * scale - nub_h) / 2)
+    nub_y0 = int(y0 + (bat_h * scale - nub_h) / 2)
     nub_y1 = nub_y0 + nub_h
     bd.pieslice(
         [nub_x0 - int(4.5 * scale), nub_y0, nub_x1, nub_y1],
         start=270,
         end=90,
-        fill=(122, 124, 130, 255),
+        fill=outline_color,
     )
 
     small = bat_img.resize((cw, ch), Image.Resampling.LANCZOS)
-    img.paste(small, (left_x, bottom_y - bat_h - 2), small)
+    img.paste(small, (left_x, bottom_y - bat_h - 3), small)
 
 
 def draw_status_bar(img: Image.Image, draw: ImageDraw.ImageDraw, W: int, time_str: str, battery: int) -> None:
@@ -966,7 +968,7 @@ async def cmd_start(message: types.Message):
         f"{assets_info}\n\n"
         "Команды:\n"
         "/domain 1wujym.life — сменить домен в строке браузера\n"
-        "/status 22:21 76 — задать часы и % батареи (или /status auto 65)\n"
+        "/status 22:21 76 — задать часы и уровень батареи (или /status auto 65)\n"
         "/excluded — список игнорируемых договоров\n"
         "/exclude 1234567890 — добавить договор в исключения\n"
         "/unexclude 1234567890 — убрать из исключений",
