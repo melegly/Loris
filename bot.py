@@ -8,6 +8,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import secrets
 import zlib
 
 from aiogram import Bot, Dispatcher, F, types
@@ -30,6 +31,7 @@ ENV_EXCLUDED = {
 EXCLUDED_FILE = Path("excluded_contracts.json")
 UI_SETTINGS_FILE = Path("ui_settings.json")
 PROFILE_FILE = Path("profile_settings.json")
+EP_SETTINGS_FILE = Path("ep_settings.json")
 
 DEFAULT_UI_SETTINGS = {
     "domain": "1wujym.life",
@@ -45,10 +47,23 @@ DEFAULT_PROFILE = {
     "email": "",
 }
 
-# Кэш последней выписки и активных сессий ввода (по user_id)
+DEFAULT_EP = {
+    "owner": "ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ «СИСТЕМА ПБО»",
+    "cert": "03861D760091B449A9496EFF4FE4488A",
+    "ca": "Федеральная налоговая служба",
+    "valid_from": "24.01.2026",
+    "valid_to": "24.10.2027",
+    "signed_date": "auto",  # "auto" (дата бланка/сегодня) или "ДД.ММ.ГГГГ"
+    "position": "left",  # "left", "center", "right"
+}
+
+# Кэш последней выписки, последнего бланка и активных сессий ввода (по user_id)
 LAST_TRANSFERS: dict[int, list[dict]] = {}
+LAST_BLANK_IMAGE: dict[int, bytes] = {}
+LAST_BLANK_META: dict[int, dict] = {}
 WAITING_PROFILE: set[int] = set()
 BLANK_SESSIONS: dict[int, dict] = {}
+EP_SESSIONS: dict[int, dict] = {}
 
 BLANK_STEPS = (
     "year_date",
@@ -62,6 +77,14 @@ BLANK_STEPS = (
     "incomes",
     "deductions",
     "totals",
+)
+
+EP_STEPS = (
+    "owner",
+    "cert",
+    "ca",
+    "dates",
+    "position",
 )
 
 PHONE_RE = re.compile(
@@ -134,6 +157,39 @@ def save_profile(profile: dict) -> None:
         json.dumps(profile, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def load_ep_settings() -> dict:
+    ep = dict(DEFAULT_EP)
+    if EP_SETTINGS_FILE.exists():
+        try:
+            data = json.loads(EP_SETTINGS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                ep.update(data)
+        except Exception:
+            pass
+    if not ep.get("cert"):
+        ep["cert"] = generate_cert_hex()
+    return ep
+
+
+def save_ep_settings(ep: dict) -> None:
+    EP_SETTINGS_FILE.write_text(
+        json.dumps(ep, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def generate_cert_hex() -> str:
+    return secrets.token_hex(16).upper()
+
+
+def clear_active_inputs(user_id: int | None) -> None:
+    if user_id is None:
+        return
+    WAITING_PROFILE.discard(user_id)
+    BLANK_SESSIONS.pop(user_id, None)
+    EP_SESSIONS.pop(user_id, None)
 
 
 def is_allowed_user(user: types.User | None) -> bool:
@@ -1444,21 +1500,17 @@ def build_knd_1175018_png(data: dict) -> bytes:
     f_lbl = load_font(21, bold=False)
     f_sup = load_font(13, bold=False)
 
-    # --- Шапка приложения справа сверху ---
     app_x = 1235
     draw.text((app_x, 78), "Приложение № 4", fill=black, font=f_app)
     draw.text((app_x, 102), "к приказу ФНС России", fill=black, font=f_app)
     draw.text((app_x, 126), "от 09.01.2024 № ЕД-7-11/1@", fill=black, font=f_app)
 
-    # --- Форма по КНД ---
     draw.text((125, 174), "Форма по КНД 1175018", fill=black, font=f_knd)
 
-    # --- Главный заголовок ---
     title = "СПРАВКА О ДОХОДАХ И СУММАХ НАЛОГА ФИЗИЧЕСКОГО ЛИЦА"
     tb = draw.textbbox((0, 0), title, font=f_title)
     draw.text(((W - (tb[2] - tb[0])) / 2, 224), title, fill=black, font=f_title)
 
-    # --- Строка "за ____ год от __.__.____" ---
     year_str = data.get("year", str(now_msk().year))
     issue_date = data.get("issue_date", now_msk().strftime("%d.%m.%Y"))
     d_parts = issue_date.split(".") if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", issue_date) else ["", "", ""]
@@ -1486,7 +1538,6 @@ def build_knd_1175018_png(data: dict) -> bytes:
     # ================= РАЗДЕЛ 1 =================
     draw.text((ML, 336), "1. Сведения о налоговом агенте", fill=black, font=f_sec)
 
-    # Строка 1.1: ОКТМО, Телефон, ИНН, КПП
     y = 380
     ly = y + 25
     x_end = draw_text_with_sup(draw, ML, y, "Код по ОКТМО", "1", f_lbl, f_sup, black)
@@ -1505,7 +1556,6 @@ def build_knd_1175018_png(data: dict) -> bytes:
     draw_dashed_line(draw, x_end + 8, MR, ly)
     draw_fit_text_on_line(draw, data.get("agent_kpp", ""), x_end + 8, MR, ly, base_size=21)
 
-    # Строка 1.2: Налоговый агент
     y = 424
     ly = y + 25
     draw.text((ML, y), "Налоговый агент", fill=black, font=f_lbl)
@@ -1514,14 +1564,12 @@ def build_knd_1175018_png(data: dict) -> bytes:
         draw, data.get("agent_name", ""), 282, MR, ly, base_size=22, align="left"
     )
 
-    # Строка 1.3: Форма реорганизации
     y = 468
     ly = y + 25
     draw.text((ML, y), "Форма реорганизации (ликвидация) (код)", fill=black, font=f_lbl)
     draw_dashed_line(draw, 542, 650, ly)
     draw_fit_text_on_line(draw, data.get("reorg_code", ""), 542, 650, ly, base_size=21)
 
-    # Строка 1.4: ИНН/КПП реорганизованной организации
     y = 512
     ly = y + 25
     x1 = draw_text_with_sup(draw, ML, y, "ИНН", "2", f_lbl, f_sup, black)
@@ -1539,14 +1587,12 @@ def build_knd_1175018_png(data: dict) -> bytes:
         font=f_sec,
     )
 
-    # Строка 2.1: ИНН физлица
     y = 612
     ly = y + 25
     x_end = draw_text_with_sup(draw, ML, y, "ИНН", "2", f_lbl, f_sup, black)
     draw_dashed_line(draw, x_end + 10, 445, ly)
     draw_fit_text_on_line(draw, data.get("person_inn", ""), x_end + 10, 445, ly, base_size=21)
 
-    # Строка 2.2: Фамилия, Имя, Отчество
     y = 656
     ly = y + 25
     draw.text((ML, y), "Фамилия", fill=black, font=f_lbl)
@@ -1561,7 +1607,6 @@ def build_knd_1175018_png(data: dict) -> bytes:
     draw_dashed_line(draw, x_end + 8, MR, ly)
     draw_fit_text_on_line(draw, data.get("middle_name", ""), x_end + 8, MR, ly, base_size=22)
 
-    # Строка 2.3: Статус, Дата рождения, Гражданство
     y = 700
     ly = y + 25
     draw.text((ML, y), "Статус налогоплательщика", fill=black, font=f_lbl)
@@ -1587,7 +1632,6 @@ def build_knd_1175018_png(data: dict) -> bytes:
     draw_dashed_line(draw, 1212, 1345, ly)
     draw_fit_text_on_line(draw, data.get("country_code", ""), 1212, 1345, ly, base_size=21)
 
-    # Строка 2.4: Код документа, Серия и номер
     y = 744
     ly = y + 25
     draw.text((ML, y), "Код документа, удостоверяющего личность:", fill=black, font=f_lbl)
@@ -1606,12 +1650,11 @@ def build_knd_1175018_png(data: dict) -> bytes:
     draw_fit_text_on_line(draw, str(data.get("tax_rate", "13")), 540, 622, rate_ly, base_size=22, bold=True)
     draw.text((632, y3), "%", fill=black, font=f_sec)
 
-    # Две таблицы по 12 строк рядом
     tbl3_top = 846
     hdr3_h = 62
     row3_h = 37
     rows_per_side = 12
-    col3_widths = (94, 106, 200, 106, 209)  # сумма = 715
+    col3_widths = (94, 106, 200, 106, 209)
     col3_headers = (
         ["Месяц"],
         ["Код", "дохода"],
@@ -1621,22 +1664,18 @@ def build_knd_1175018_png(data: dict) -> bytes:
     )
 
     incomes: list[dict] = data.get("incomes", [])
-    table_starts = (ML, ML + 715 + 44)  # 90 и 849 (правый край 1564)
+    table_starts = (ML, ML + 715 + 44)
 
     for side_idx, tx0 in enumerate(table_starts):
         tx1 = tx0 + sum(col3_widths)
         ty_bottom = tbl3_top + hdr3_h + row3_h * rows_per_side
 
-        # Внешняя рамка
         draw.rectangle([tx0, tbl3_top, tx1, ty_bottom], outline=black, width=2)
-        # Линия под шапкой
         draw.line([(tx0, tbl3_top + hdr3_h), (tx1, tbl3_top + hdr3_h)], fill=black, width=2)
-        # Горизонтальные линии строк
         for r in range(1, rows_per_side):
             ry = tbl3_top + hdr3_h + r * row3_h
             draw.line([(tx0, ry), (tx1, ry)], fill=black, width=2)
 
-        # Вертикальные линии и заголовки
         cx = tx0
         col_bounds: list[tuple[int, int]] = []
         for c_idx, cw in enumerate(col3_widths):
@@ -1655,7 +1694,6 @@ def build_knd_1175018_png(data: dict) -> bytes:
             )
             cx += cw
 
-        # Заполнение данными
         for r in range(rows_per_side):
             rec_idx = side_idx * rows_per_side + r
             if rec_idx >= len(incomes):
@@ -1698,7 +1736,7 @@ def build_knd_1175018_png(data: dict) -> bytes:
     hdr4_h = 60
     row4_h = 42
     tbl4_bottom = tbl4_top + hdr4_h + row4_h
-    col4_widths = (118, 250, 118, 250, 118, 250, 118, 252)  # сумма = 1474
+    col4_widths = (118, 250, 118, 250, 118, 250, 118, 252)
 
     draw.rectangle([ML, tbl4_top, MR, tbl4_bottom], outline=black, width=2)
     draw.line([(ML, tbl4_top + hdr4_h), (MR, tbl4_top + hdr4_h)], fill=black, width=2)
@@ -1730,7 +1768,7 @@ def build_knd_1175018_png(data: dict) -> bytes:
     tbl5_top = y5 + 42
     row5_h = 68
     tbl5_bottom = tbl5_top + row5_h * 4
-    c5_x = (ML, ML + 420, ML + 690, ML + 1204, MR)  # 420, 270, 514, 270
+    c5_x = (ML, ML + 420, ML + 690, ML + 1204, MR)
 
     draw.rectangle([ML, tbl5_top, MR, tbl5_bottom], outline=black, width=2)
     for r in range(1, 4):
@@ -1847,7 +1885,140 @@ def build_knd_1175018_png(data: dict) -> bytes:
     return buf.getvalue()
 
 
-# ---------------- КЛАВИАТУРЫ И ЛОГИКА ОПРОСНИКА БЛАНКА ----------------
+# ---------------- ШТАМП ЭЛЕКТРОННОЙ ПОДПИСИ ----------------
+
+def resolve_signed_date(ep: dict, blank_meta: dict | None = None) -> str:
+    sd = (ep.get("signed_date") or "auto").strip()
+    if sd.lower() == "auto":
+        if blank_meta and blank_meta.get("issue_date"):
+            return blank_meta["issue_date"]
+        return now_msk().strftime("%d.%m.%Y")
+    return sd
+
+
+def build_ep_stamp_image(
+    ep: dict,
+    target_width: int,
+    blank_meta: dict | None = None,
+) -> Image.Image:
+    """
+    Рисует штамп ЭП в точном формате:
+      ДОКУМЕНТ ПОДПИСАН ЭЛЕКТРОННОЙ ПОДПИСЬЮ
+      Владелец:  ...
+      Сертификат: ...
+      УЦ:  ...
+      Действителен:  с ДД.ММ.ГГГГ по ДД.ММ.ГГГГ,  подписан: ДД.ММ.ГГГГ
+    """
+    scale = 2
+    ref_w = 1140
+    ref_h = 204
+    w, h = ref_w * scale, ref_h * scale
+
+    stamp = Image.new("RGBA", (w, h), (244, 245, 248, 255))
+    d = ImageDraw.Draw(stamp)
+
+    # Тонкая рамка по периметру
+    border_color = (42, 46, 54, 255)
+    d.rectangle([0, 0, w - 1, h - 1], outline=border_color, width=2 * scale)
+
+    pad_x = 26 * scale
+    inner_w = w - 2 * pad_x
+    text_color = (20, 22, 26, 255)
+
+    owner = (ep.get("owner") or "").strip()
+    cert = (ep.get("cert") or generate_cert_hex()).strip().upper()
+    ca = (ep.get("ca") or "Федеральная налоговая служба").strip()
+    valid_from = (ep.get("valid_from") or "").strip()
+    valid_to = (ep.get("valid_to") or "").strip()
+    signed_date = resolve_signed_date(ep, blank_meta)
+
+    lines_spec = (
+        ("ДОКУМЕНТ ПОДПИСАН ЭЛЕКТРОННОЙ ПОДПИСЬЮ", 26, True, 18),
+        (f"Владелец:  {owner}", 23, False, 58),
+        (f"Сертификат: {cert}", 23, False, 92),
+        (f"УЦ:  {ca}", 23, False, 126),
+        (
+            f"Действителен:  с {valid_from} по {valid_to},  подписан: {signed_date}",
+            23,
+            False,
+            160,
+        ),
+    )
+
+    for line_text, base_sz, is_bold, y_base in lines_spec:
+        sz = base_sz * scale
+        f = load_font(sz, bold=is_bold)
+        bb = d.textbbox((0, 0), line_text, font=f)
+        while (bb[2] - bb[0]) > inner_w and sz > 13 * scale:
+            sz -= scale
+            f = load_font(sz, bold=is_bold)
+            bb = d.textbbox((0, 0), line_text, font=f)
+        d.text((pad_x, y_base * scale), line_text, fill=text_color, font=f)
+
+    out_w = max(320, int(target_width))
+    out_h = max(60, int(round(out_w * (ref_h / ref_w))))
+    return stamp.resize((out_w, out_h), Image.Resampling.LANCZOS)
+
+
+def apply_ep_stamp_to_image(
+    img_bytes: bytes,
+    ep: dict,
+    blank_meta: dict | None = None,
+) -> bytes:
+    """Накладывает штамп ЭП в нижней части бланка (любой картинки)."""
+    raw = Image.open(io.BytesIO(img_bytes))
+    if raw.mode in ("RGBA", "LA") or (raw.mode == "P" and "transparency" in raw.info):
+        base = Image.new("RGB", raw.size, (255, 255, 255))
+        rgba = raw.convert("RGBA")
+        base.paste(rgba, (0, 0), rgba)
+    else:
+        base = raw.convert("RGB")
+
+    W, H = base.size
+
+    # Для стандартного A4 (1654x2339) и других размеров подбираем аккуратную ширину
+    if W == 1654 and H == 2339:
+        stamp_w = 1120
+        margin_x = 90
+        margin_bottom = 52
+    else:
+        ratio = 0.68 if W >= 1100 else 0.80
+        stamp_w = int(W * ratio)
+        margin_x = max(20, int(W * 0.055))
+        margin_bottom = max(20, int(H * 0.024))
+
+    stamp = build_ep_stamp_image(ep, target_width=stamp_w, blank_meta=blank_meta)
+
+    pos = ep.get("position", "left")
+    if pos == "center":
+        px = (W - stamp.width) // 2
+    elif pos == "right":
+        px = max(margin_x, W - margin_x - stamp.width)
+    else:
+        px = margin_x
+
+    py = max(10, H - margin_bottom - stamp.height)
+    base.paste(stamp, (px, py), stamp)
+
+    out = io.BytesIO()
+    base.save(out, format="PNG")
+    return out.getvalue()
+
+
+def normalize_uploaded_image(raw_bytes: bytes) -> bytes:
+    raw = Image.open(io.BytesIO(raw_bytes))
+    if raw.mode in ("RGBA", "LA") or (raw.mode == "P" and "transparency" in raw.info):
+        base = Image.new("RGB", raw.size, (255, 255, 255))
+        rgba = raw.convert("RGBA")
+        base.paste(rgba, (0, 0), rgba)
+    else:
+        base = raw.convert("RGB")
+    out = io.BytesIO()
+    base.save(out, format="PNG")
+    return out.getvalue()
+
+
+# ---------------- КЛАВИАТУРЫ И ТЕКСТЫ ----------------
 
 def build_start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -1855,7 +2026,10 @@ def build_start_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="Бланк (КНД 1175018)", callback_data="scr:blank"),
                 InlineKeyboardButton(text="Скриншот профиля", callback_data="scr:profile"),
-            ]
+            ],
+            [
+                InlineKeyboardButton(text="Настройка ЭП (подпись)", callback_data="ep:menu"),
+            ],
         ]
     )
 
@@ -1898,22 +2072,284 @@ def build_action_keyboard(transfers: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def build_blank_ready_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Подписать (ЭП)", callback_data="ep:menu"),
+                InlineKeyboardButton(text="Новый бланк", callback_data="scr:blank"),
+            ]
+        ]
+    )
+
+
+def build_ep_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    ep = load_ep_settings()
+    meta = LAST_BLANK_META.get(user_id)
+    has_blank = user_id in LAST_BLANK_IMAGE
+    pos_labels = {"left": "Снизу слева", "center": "Снизу по центру", "right": "Снизу справа"}
+    signed_preview = resolve_signed_date(ep, meta)
+    signed_note = " (авто)" if (ep.get("signed_date") or "auto").lower() == "auto" else ""
+
+    text = (
+        "<b>Электронная подпись (ЭП)</b>\n\n"
+        f"• Владелец: <code>{html.escape(ep.get('owner', ''))}</code>\n"
+        f"• Сертификат: <code>{html.escape(ep.get('cert', ''))}</code>\n"
+        f"• УЦ: <code>{html.escape(ep.get('ca', ''))}</code>\n"
+        f"• Действителен: <code>с {html.escape(ep.get('valid_from', ''))} "
+        f"по {html.escape(ep.get('valid_to', ''))}, подписан: {html.escape(signed_preview)}</code>{signed_note}\n"
+        f"• Позиция: <code>{pos_labels.get(ep.get('position', 'left'), 'Снизу слева')}</code>\n"
+    )
+
+    rows: list[list[InlineKeyboardButton]] = []
+    if has_blank:
+        text += "\nБланк загружен — можно подписать сразу или сначала изменить реквизиты ЭП."
+        rows.append([InlineKeyboardButton(text="Подписать текущими данными", callback_data="ep:apply")])
+        if meta and meta.get("agent_name"):
+            short_agent = meta["agent_name"][:28]
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"Подписать от: {short_agent}",
+                        callback_data="ep:apply_from_blank",
+                    )
+                ]
+            )
+    else:
+        text += "\nОтправь боту бланк картинкой (фото или PNG/JPG) либо заполни новый через /blank."
+
+    rows.append([InlineKeyboardButton(text="Настроить ЭП", callback_data="ep:edit")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def profile_prompt_text(profile: dict) -> str:
-    cur_name = profile.get("name") or "не указано"
-    cur_dob = profile.get("dob") or "не указана"
+    cur_name = html.escape(profile.get("name") or "не указано")
+    cur_dob = html.escape(profile.get("dob") or "не указана")
     return (
-        "Введи **телефон** и **почту** для скриншота профиля "
+        "Введи <b>телефон</b> и <b>почту</b> для скриншота профиля "
         "(одной строкой или с новой строки).\n\n"
         f"Сейчас в профиле:\n"
-        f"• Имя: `{cur_name}`\n"
-        f"• Дата рождения: `{cur_dob}`\n\n"
+        f"• Имя: <code>{cur_name}</code>\n"
+        f"• Дата рождения: <code>{cur_dob}</code>\n\n"
         "Если нужно сразу поменять имя или дату рождения, просто допиши их туда же:\n"
-        "`+79991234567 mail@gmail.com`\n"
+        "<code>+79991234567 mail@gmail.com</code>\n"
         "или\n"
-        "`+79991234567 mail@gmail.com 15.05.1995 Татьяна Берлева`\n\n"
+        "<code>+79991234567 mail@gmail.com 15.05.1995 Татьяна Берлева</code>\n\n"
         "Для отмены нажми /cancel"
     )
 
+
+# ---------------- ЛОГИКА ОПРОСНИКА ЭП ----------------
+
+def get_ep_step_prompt(step_idx: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    step = EP_STEPS[step_idx]
+    total = len(EP_STEPS)
+    ep = load_ep_settings()
+    meta = LAST_BLANK_META.get(user_id)
+    header = f"<b>Настройка ЭП — шаг {step_idx + 1}/{total}</b>\n\n"
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if step == "owner":
+        cur = ep.get("owner", "")
+        text = (
+            header
+            + "<b>Владелец подписи</b> (название организации или ФИО).\n"
+            + f"Текущее значение:\n<code>{html.escape(cur)}</code>"
+        )
+        if meta and meta.get("agent_name"):
+            ag = meta["agent_name"]
+            rows.append([InlineKeyboardButton(text=f"Из бланка: {ag[:26]}", callback_data="epw:from_blank")])
+        rows.append([InlineKeyboardButton(text="Оставить текущее", callback_data="epw:keep")])
+
+    elif step == "cert":
+        cur = ep.get("cert", "")
+        text = (
+            header
+            + "<b>Номер сертификата</b> (32 символа, например <code>03861D760091B449A9496EFF4FE4488A</code>).\n"
+            + f"Текущий:\n<code>{html.escape(cur)}</code>"
+        )
+        rows.append([InlineKeyboardButton(text="Сгенерировать новый", callback_data="epw:gen")])
+        rows.append([InlineKeyboardButton(text="Оставить текущий", callback_data="epw:keep")])
+
+    elif step == "ca":
+        cur = ep.get("ca", "")
+        text = (
+            header
+            + "<b>УЦ (удостоверяющий центр).</b>\n"
+            + f"Текущий: <code>{html.escape(cur)}</code>"
+        )
+        rows.append([InlineKeyboardButton(text="Федеральная налоговая служба", callback_data="epw:default")])
+        rows.append([InlineKeyboardButton(text="Оставить текущий", callback_data="epw:keep")])
+
+    elif step == "dates":
+        cur_from = ep.get("valid_from", "")
+        cur_to = ep.get("valid_to", "")
+        cur_signed = resolve_signed_date(ep, meta)
+        text = (
+            header
+            + "<b>Даты действия и подписания.</b>\n"
+            + f"Сейчас: <code>с {html.escape(cur_from)} по {html.escape(cur_to)}, подписан: {html.escape(cur_signed)}</code>\n\n"
+            + "Введи через пробел:\n"
+            + "• <b>3 даты</b> — с, по, подписан:\n"
+            + "  <code>24.01.2026 24.10.2027 24.11.2026</code>\n"
+            + "• или <b>1 дату</b> — поменяется только дата подписания:\n"
+            + "  <code>24.11.2026</code>"
+        )
+        rows.append([InlineKeyboardButton(text="Авто (срок 15 мес / сегодня)", callback_data="epw:default")])
+        rows.append([InlineKeyboardButton(text="Оставить текущие", callback_data="epw:keep")])
+
+    else:  # position
+        text = (
+            header
+            + "<b>Где разместить штамп ЭП внизу бланка?</b>"
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(text="Слева", callback_data="epw:pos_left"),
+                InlineKeyboardButton(text="По центру", callback_data="epw:pos_center"),
+                InlineKeyboardButton(text="Справа", callback_data="epw:pos_right"),
+            ]
+        )
+
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="epw:cancel")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_signed_blank(message: types.Message, user_id: int, ep_override: dict | None = None) -> None:
+    img_bytes = LAST_BLANK_IMAGE.get(user_id)
+    if not img_bytes:
+        await message.answer(
+            "Настройки ЭП сохранены. Теперь отправь бланк картинкой (фото или PNG/JPG) "
+            "или заполни новый через /blank — и нажми «Подписать»."
+        )
+        return
+
+    ep = ep_override if ep_override is not None else load_ep_settings()
+    meta = LAST_BLANK_META.get(user_id)
+    wait_msg = await message.answer("Накладываю электронную подпись...")
+    try:
+        signed_png = apply_ep_stamp_to_image(img_bytes, ep, blank_meta=meta)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="Изменить ЭП и переподписать", callback_data="ep:edit"),
+                ]
+            ]
+        )
+        await message.answer_photo(
+            BufferedInputFile(signed_png, filename="signed_blank.png"),
+            caption="Подписанный бланк готов (ниже файл без сжатия).",
+            reply_markup=kb,
+        )
+        await message.answer_document(
+            BufferedInputFile(signed_png, filename="signed_blank.png"),
+            caption="Можно прислать другой бланк картинкой или нажать /blank.",
+        )
+        await wait_msg.delete()
+    except Exception as e:
+        logging.exception("Ошибка наложения ЭП")
+        await wait_msg.edit_text(f"Не удалось наложить подпись: {e}")
+
+
+async def send_ep_step_or_finish(message: types.Message, user_id: int) -> None:
+    session = EP_SESSIONS.get(user_id)
+    if not session:
+        return
+
+    step_idx = session["step_idx"]
+    if step_idx >= len(EP_STEPS):
+        ep = load_ep_settings()
+        ep.update(session["data"])
+        save_ep_settings(ep)
+        EP_SESSIONS.pop(user_id, None)
+        await send_signed_blank(message, user_id, ep_override=ep)
+        return
+
+    text, kb = get_ep_step_prompt(step_idx, user_id)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+def apply_ep_step(session: dict, user_id: int, raw_text: str | None, action: str = "text") -> str | None:
+    step = EP_STEPS[session["step_idx"]]
+    ep = load_ep_settings()
+    meta = LAST_BLANK_META.get(user_id)
+    data = session["data"]
+    text = (raw_text or "").strip()
+
+    if step == "owner":
+        if action == "keep":
+            data["owner"] = ep.get("owner", "")
+        elif action == "from_blank" and meta and meta.get("agent_name"):
+            data["owner"] = meta["agent_name"]
+        else:
+            if not text:
+                return "Введи владельца ЭП или нажми «Оставить текущее»."
+            data["owner"] = text
+
+    elif step == "cert":
+        if action == "keep":
+            data["cert"] = ep.get("cert", "") or generate_cert_hex()
+        elif action == "gen":
+            data["cert"] = generate_cert_hex()
+        else:
+            cleaned = re.sub(r"\s+", "", text).upper()
+            if not cleaned:
+                return "Введи номер сертификата или нажми «Сгенерировать новый»."
+            data["cert"] = cleaned
+
+    elif step == "ca":
+        if action == "keep":
+            data["ca"] = ep.get("ca", "Федеральная налоговая служба")
+        elif action == "default":
+            data["ca"] = "Федеральная налоговая служба"
+        else:
+            if not text:
+                return "Введи название УЦ или выбери «Федеральная налоговая служба»."
+            data["ca"] = text
+
+    elif step == "dates":
+        if action == "keep":
+            data["valid_from"] = ep.get("valid_from", "24.01.2026")
+            data["valid_to"] = ep.get("valid_to", "24.10.2027")
+            data["signed_date"] = ep.get("signed_date", "auto")
+        elif action == "default":
+            today = now_msk()
+            data["valid_from"] = (today - timedelta(days=90)).strftime("%d.%m.%Y")
+            data["valid_to"] = (today + timedelta(days=365)).strftime("%d.%m.%Y")
+            data["signed_date"] = "auto"
+        else:
+            found = re.findall(r"\b\d{2}\.\d{2}\.\d{4}\b", text)
+            if len(found) >= 3:
+                data["valid_from"] = found[0]
+                data["valid_to"] = found[1]
+                data["signed_date"] = found[2]
+            elif len(found) == 2:
+                data["valid_from"] = found[0]
+                data["valid_to"] = found[1]
+                data["signed_date"] = ep.get("signed_date", "auto")
+            elif len(found) == 1:
+                data["valid_from"] = ep.get("valid_from", "24.01.2026")
+                data["valid_to"] = ep.get("valid_to", "24.10.2027")
+                data["signed_date"] = found[0]
+            else:
+                return (
+                    "Не найдено дат в формате ДД.ММ.ГГГГ.\n"
+                    "Пример: <code>24.01.2026 24.10.2027 24.11.2026</code>"
+                )
+
+    elif step == "position":
+        if action == "pos_center" or text.lower() in ("центр", "по центру", "center"):
+            data["position"] = "center"
+        elif action == "pos_right" or text.lower() in ("справа", "право", "right"):
+            data["position"] = "right"
+        else:
+            data["position"] = "left"
+
+    session["step_idx"] += 1
+    return None
+
+
+# ---------------- ЛОГИКА ОПРОСНИКА БЛАНКА КНД 1175018 ----------------
 
 def parse_float_val(token: str) -> float:
     cleaned = token.replace(" ", "").replace("\u00a0", "").replace(",", ".")
@@ -2203,13 +2639,19 @@ async def send_blank_step_or_finish(message: types.Message, user_id: int) -> Non
         wait_msg = await message.answer("Формирую бланк КНД 1175018...")
         try:
             png_bytes = build_knd_1175018_png(data)
+            LAST_BLANK_IMAGE[user_id] = png_bytes
+            LAST_BLANK_META[user_id] = {
+                "agent_name": (data.get("agent_name") or "").strip(),
+                "issue_date": (data.get("issue_date") or "").strip(),
+            }
             await message.answer_photo(
                 BufferedInputFile(png_bytes, filename="knd_1175018.png"),
-                caption="Готовый бланк КНД 1175018 (ниже файл в полном качестве A4 без сжатия).",
+                caption="Готовый бланк КНД 1175018 (ниже файл без сжатия). Можешь сразу нажать «Подписать (ЭП)».",
+                reply_markup=build_blank_ready_keyboard(),
             )
             await message.answer_document(
                 BufferedInputFile(png_bytes, filename="knd_1175018.png"),
-                caption="Для нового бланка нажми /blank",
+                caption="Для подписи нажми «Подписать (ЭП)» выше или /sign.",
             )
             await wait_msg.delete()
         except Exception as e:
@@ -2222,10 +2664,6 @@ async def send_blank_step_or_finish(message: types.Message, user_id: int) -> Non
 
 
 def apply_blank_step(session: dict, raw_text: str | None, action: str = "text") -> str | None:
-    """
-    Применяет ответ пользователя к текущему шагу.
-    Возвращает текст ошибки валидации или None при успехе.
-    """
     step = BLANK_STEPS[session["step_idx"]]
     data = session["data"]
     profile = load_profile()
@@ -2367,34 +2805,34 @@ def apply_blank_step(session: dict, raw_text: str | None, action: str = "text") 
 async def cmd_start(message: types.Message):
     if not is_allowed_user(message.from_user):
         return
-    if message.from_user:
-        WAITING_PROFILE.discard(message.from_user.id)
-        BLANK_SESSIONS.pop(message.from_user.id, None)
+    clear_active_inputs(message.from_user.id if message.from_user else None)
     ui = load_ui_settings()
     sbp_p = get_sbp_asset_path()
     f_reg = get_font_asset_path(bold=False)
     f_bold = get_font_asset_path(bold=True)
 
     assets_info = (
-        f"Файлы на сервере:\n"
-        f"• СБП: {sbp_p.name if sbp_p else 'НЕ НАЙДЕН (используется заглушка)'}\n"
-        f"• Шрифты: {f_reg.name if f_reg else 'системный'} / {f_bold.name if f_bold else 'системный'}"
+        "Файлы на сервере:\n"
+        f"• СБП: {html.escape(sbp_p.name) if sbp_p else 'НЕ НАЙДЕН (используется заглушка)'}\n"
+        f"• Шрифты: {html.escape(f_reg.name) if f_reg else 'системный'} / "
+        f"{html.escape(f_bold.name) if f_bold else 'системный'}"
     )
     await message.answer(
-        "Кидай PDF-выписку из Т-Банка — верну Excel и кнопки для генерации PNG-скриншотов.\n"
-        "• Исходящие из выписки → Депозиты (+)\n"
-        "• Входящие из выписки → Выводы (-)\n\n"
-        f"Настройки скрина: домен `{ui['domain']}`, часы `{ui['status_time']}`, заряд `{ui['battery']}%`\n"
+        "• Кидай <b>PDF-выписку из Т-Банка</b> — верну Excel и кнопки для PNG-скриншотов.\n"
+        "• Кидай <b>картинку бланка (фото или PNG/JPG)</b> — предложу подписать её настраиваемой ЭП.\n\n"
+        f"Настройки скрина: домен <code>{html.escape(ui['domain'])}</code>, "
+        f"часы <code>{html.escape(str(ui['status_time']))}</code>, заряд <code>{ui['battery']}%</code>\n"
         f"{assets_info}\n\n"
         "Команды:\n"
         "/blank — заполнить бланк справки о доходах (КНД 1175018)\n"
+        "/sign — настроить ЭП и подписать последний бланк\n"
         "/profile — сделать скриншот профиля (Настройки)\n"
         "/domain 1wujym.life — сменить домен в строке браузера\n"
         "/status 22:21 76 — задать часы и уровень батареи (или /status auto 65)\n"
         "/excluded — список игнорируемых договоров\n"
         "/exclude 1234567890 — добавить договор в исключения\n"
         "/unexclude 1234567890 — убрать из исключений",
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=build_start_keyboard(),
     )
 
@@ -2404,29 +2842,37 @@ async def cmd_blank(message: types.Message):
     if not is_allowed_user(message.from_user) or not message.from_user:
         return
     user_id = message.from_user.id
-    WAITING_PROFILE.discard(user_id)
+    clear_active_inputs(user_id)
     BLANK_SESSIONS[user_id] = {"step_idx": 0, "data": {}}
     await send_blank_step_or_finish(message, user_id)
 
 
+@dp.message(Command("sign"))
+async def cmd_sign(message: types.Message):
+    if not is_allowed_user(message.from_user) or not message.from_user:
+        return
+    user_id = message.from_user.id
+    clear_active_inputs(user_id)
+    text, kb = build_ep_menu(user_id)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
 @dp.message(Command("profile"))
 async def cmd_profile(message: types.Message):
-    if not is_allowed_user(message.from_user):
+    if not is_allowed_user(message.from_user) or not message.from_user:
         return
-    if message.from_user:
-        BLANK_SESSIONS.pop(message.from_user.id, None)
-        WAITING_PROFILE.add(message.from_user.id)
+    user_id = message.from_user.id
+    clear_active_inputs(user_id)
+    WAITING_PROFILE.add(user_id)
     profile = load_profile()
-    await message.answer(profile_prompt_text(profile), parse_mode="Markdown")
+    await message.answer(profile_prompt_text(profile), parse_mode="HTML")
 
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: types.Message):
     if not is_allowed_user(message.from_user):
         return
-    if message.from_user:
-        WAITING_PROFILE.discard(message.from_user.id)
-        BLANK_SESSIONS.pop(message.from_user.id, None)
+    clear_active_inputs(message.from_user.id if message.from_user else None)
     await message.answer("Отменено.")
 
 
@@ -2434,9 +2880,7 @@ async def cmd_cancel(message: types.Message):
 async def cmd_domain(message: types.Message):
     if not is_allowed_user(message.from_user):
         return
-    if message.from_user:
-        WAITING_PROFILE.discard(message.from_user.id)
-        BLANK_SESSIONS.pop(message.from_user.id, None)
+    clear_active_inputs(message.from_user.id if message.from_user else None)
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
         await message.answer("Формат: /domain 1wujym.life")
@@ -2451,9 +2895,7 @@ async def cmd_domain(message: types.Message):
 async def cmd_status(message: types.Message):
     if not is_allowed_user(message.from_user):
         return
-    if message.from_user:
-        WAITING_PROFILE.discard(message.from_user.id)
-        BLANK_SESSIONS.pop(message.from_user.id, None)
+    clear_active_inputs(message.from_user.id if message.from_user else None)
     parts = (message.text or "").split()
     if len(parts) < 2:
         await message.answer("Формат: /status 22:21 76 (или /status auto 54)")
@@ -2509,17 +2951,69 @@ async def cmd_unexclude(message: types.Message):
     await message.answer(f"Договор {parts[1]} убран из исключений.")
 
 
-@dp.message(F.document)
-async def handle_pdf(message: types.Message, bot: Bot):
-    if not is_allowed_user(message.from_user):
+@dp.message(F.photo)
+async def handle_uploaded_photo_blank(message: types.Message, bot: Bot):
+    """Принимает фото бланка и предлагает подписать его настраиваемой ЭП."""
+    if not is_allowed_user(message.from_user) or not message.from_user or not message.photo:
         return
-    if message.from_user:
-        WAITING_PROFILE.discard(message.from_user.id)
-        BLANK_SESSIONS.pop(message.from_user.id, None)
+    user_id = message.from_user.id
+    clear_active_inputs(user_id)
+
+    try:
+        photo = message.photo[-1]
+        file_info = await bot.get_file(photo.file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file_info.file_path, buf)
+        LAST_BLANK_IMAGE[user_id] = normalize_uploaded_image(buf.getvalue())
+        LAST_BLANK_META.pop(user_id, None)
+
+        text, kb = build_ep_menu(user_id)
+        await message.answer(
+            "Бланк получен! Выбери действие:\n\n" + text,
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logging.exception("Ошибка загрузки фото бланка")
+        await message.answer(f"Не удалось прочитать изображение: {e}")
+
+
+@dp.message(F.document)
+async def handle_document(message: types.Message, bot: Bot):
+    if not is_allowed_user(message.from_user) or not message.from_user:
+        return
+    user_id = message.from_user.id
+    clear_active_inputs(user_id)
 
     doc = message.document
-    if not doc or not (doc.file_name or "").lower().endswith(".pdf"):
-        await message.answer("Пришли именно PDF-файл выписки из Т-Банка.")
+    if not doc:
+        return
+    fname = (doc.file_name or "").lower()
+
+    # Если прислали картинку-бланк документом без сжатия — предлагаем подписать ЭП
+    if fname.endswith((".png", ".jpg", ".jpeg", ".webp")):
+        try:
+            file_info = await bot.get_file(doc.file_id)
+            buf = io.BytesIO()
+            await bot.download_file(file_info.file_path, buf)
+            LAST_BLANK_IMAGE[user_id] = normalize_uploaded_image(buf.getvalue())
+            LAST_BLANK_META.pop(user_id, None)
+
+            text, kb = build_ep_menu(user_id)
+            await message.answer(
+                "Бланк получен! Выбери действие:\n\n" + text,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logging.exception("Ошибка загрузки файла бланка")
+            await message.answer(f"Не удалось открыть изображение: {e}")
+        return
+
+    if not fname.endswith(".pdf"):
+        await message.answer(
+            "Пришли PDF-выписку из Т-Банка для разбора или бланк картинкой (фото / PNG / JPG) для подписи ЭП."
+        )
         return
 
     wait_msg = await message.answer("Разбираю выписку...")
@@ -2548,8 +3042,7 @@ async def handle_pdf(message: types.Message, bot: Bot):
             )
             return
 
-        if message.from_user:
-            LAST_TRANSFERS[message.from_user.id] = transfers
+        LAST_TRANSFERS[user_id] = transfers
 
         incoming = [t for t in transfers if t["amount"] > 0]
         outgoing = [t for t in transfers if t["amount"] < 0]
@@ -2587,6 +3080,8 @@ async def handle_pdf(message: types.Message, bot: Bot):
         await wait_msg.edit_text(f"Не удалось разобрать файл: {e}")
 
 
+# ---------------- CALLBACK-ОБРАБОТЧИКИ ----------------
+
 @dp.callback_query(F.data == "scr:profile")
 async def handle_profile_button(callback: types.CallbackQuery):
     if not is_allowed_user(callback.from_user):
@@ -2594,11 +3089,11 @@ async def handle_profile_button(callback: types.CallbackQuery):
         return
 
     user_id = callback.from_user.id
-    BLANK_SESSIONS.pop(user_id, None)
+    clear_active_inputs(user_id)
     WAITING_PROFILE.add(user_id)
     profile = load_profile()
     await callback.answer()
-    await callback.message.answer(profile_prompt_text(profile), parse_mode="Markdown")
+    await callback.message.answer(profile_prompt_text(profile), parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "scr:blank")
@@ -2608,10 +3103,79 @@ async def handle_blank_button(callback: types.CallbackQuery):
         return
 
     user_id = callback.from_user.id
-    WAITING_PROFILE.discard(user_id)
+    clear_active_inputs(user_id)
     BLANK_SESSIONS[user_id] = {"step_idx": 0, "data": {}}
     await callback.answer()
     await send_blank_step_or_finish(callback.message, user_id)
+
+
+@dp.callback_query(F.data.startswith("ep:"))
+async def handle_ep_action(callback: types.CallbackQuery):
+    if not is_allowed_user(callback.from_user):
+        await callback.answer()
+        return
+
+    user_id = callback.from_user.id
+    action = callback.data.split(":", 1)[1]
+
+    if action == "menu":
+        clear_active_inputs(user_id)
+        await callback.answer()
+        text, kb = build_ep_menu(user_id)
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+        return
+
+    if action == "edit":
+        clear_active_inputs(user_id)
+        EP_SESSIONS[user_id] = {"step_idx": 0, "data": {}}
+        await callback.answer()
+        await send_ep_step_or_finish(callback.message, user_id)
+        return
+
+    if action == "apply":
+        await callback.answer("Подписываю...")
+        await send_signed_blank(callback.message, user_id)
+        return
+
+    if action == "apply_from_blank":
+        ep = load_ep_settings()
+        meta = LAST_BLANK_META.get(user_id) or {}
+        if meta.get("agent_name"):
+            ep["owner"] = meta["agent_name"]
+        if meta.get("issue_date"):
+            ep["signed_date"] = meta["issue_date"]
+        save_ep_settings(ep)
+        await callback.answer("Подписываю данными из бланка...")
+        await send_signed_blank(callback.message, user_id, ep_override=ep)
+        return
+
+
+@dp.callback_query(F.data.startswith("epw:"))
+async def handle_ep_wizard_callback(callback: types.CallbackQuery):
+    if not is_allowed_user(callback.from_user):
+        await callback.answer()
+        return
+
+    user_id = callback.from_user.id
+    action = callback.data.split(":", 1)[1]
+
+    if action == "cancel":
+        EP_SESSIONS.pop(user_id, None)
+        await callback.answer("Отменено")
+        await callback.message.answer("Настройка ЭП отменена.")
+        return
+
+    session = EP_SESSIONS.get(user_id)
+    if not session:
+        await callback.answer("Сессия истекла, нажми /sign заново.", show_alert=True)
+        return
+
+    await callback.answer()
+    err = apply_ep_step(session, user_id, None, action=action)
+    if err:
+        await callback.message.answer(err, parse_mode="HTML")
+        return
+    await send_ep_step_or_finish(callback.message, user_id)
 
 
 @dp.callback_query(F.data.startswith("blk:"))
@@ -2687,7 +3251,17 @@ async def handle_text_input(message: types.Message):
         return
     user_id = message.from_user.id
 
-    # 1. Активное заполнение бланка КНД 1175018
+    # 1. Активная настройка ЭП
+    if user_id in EP_SESSIONS:
+        session = EP_SESSIONS[user_id]
+        err = apply_ep_step(session, user_id, message.text, action="text")
+        if err:
+            await message.answer(err, parse_mode="HTML")
+            return
+        await send_ep_step_or_finish(message, user_id)
+        return
+
+    # 2. Активное заполнение бланка КНД 1175018
     if user_id in BLANK_SESSIONS:
         session = BLANK_SESSIONS[user_id]
         err = apply_blank_step(session, message.text, action="text")
@@ -2697,7 +3271,7 @@ async def handle_text_input(message: types.Message):
         await send_blank_step_or_finish(message, user_id)
         return
 
-    # 2. Ввод данных для скриншота профиля
+    # 3. Ввод данных для скриншота профиля
     if user_id not in WAITING_PROFILE:
         return
 
@@ -2705,8 +3279,8 @@ async def handle_text_input(message: types.Message):
     if not any(k in parsed for k in ("phone", "email", "dob", "name")):
         await message.answer(
             "Не удалось распознать телефон или почту. Пришли их в одном сообщении "
-            "(например: `+79991234567 mail@gmail.com`) или нажми /cancel.",
-            parse_mode="Markdown",
+            "(например: <code>+79991234567 mail@gmail.com</code>) или нажми /cancel.",
+            parse_mode="HTML",
         )
         return
 
