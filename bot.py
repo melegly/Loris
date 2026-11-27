@@ -1,6 +1,7 @@
 import asyncio
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+import html
 import io
 import json
 import logging
@@ -44,9 +45,24 @@ DEFAULT_PROFILE = {
     "email": "",
 }
 
-# Кэш последней разобранной выписки и состояние ввода данных профиля (по user_id)
+# Кэш последней выписки и активных сессий ввода (по user_id)
 LAST_TRANSFERS: dict[int, list[dict]] = {}
 WAITING_PROFILE: set[int] = set()
+BLANK_SESSIONS: dict[int, dict] = {}
+
+BLANK_STEPS = (
+    "year_date",
+    "agent_name",
+    "agent_details",
+    "fio",
+    "person_inn",
+    "person_meta",
+    "passport",
+    "tax_rate",
+    "incomes",
+    "deductions",
+    "totals",
+)
 
 PHONE_RE = re.compile(
     r"(?:\+?7|8)[\s\-\(\)]*\d{3}[\s\-\(\)]*\d{3}[\s\-\(\)]*\d{2}[\s\-\(\)]*\d{2}"
@@ -126,10 +142,13 @@ def is_allowed_user(user: types.User | None) -> bool:
     return user is not None and user.id == ALLOWED_USER_ID
 
 
+def now_msk() -> datetime:
+    return datetime.now(timezone(timedelta(hours=3)))
+
+
 # ---------------- РАЗБОР PDF Т-БАНКА ----------------
 
 def extract_client_name(first_page_text: str) -> str:
-    """Извлекает ФИО клиента из шапки PDF-выписки Т-Банка."""
     stop_words = (
         "справка",
         "акционерное",
@@ -446,7 +465,6 @@ def parse_tbank_pdf(
 
 
 def parse_profile_input(text: str) -> dict[str, str]:
-    """Разбирает сообщение пользователя на почту, телефон, дату рождения и имя."""
     parsed: dict[str, str] = {}
     remaining = text.strip()
 
@@ -531,7 +549,7 @@ def build_excel(rows: list[dict]) -> bytes:
     return output.getvalue()
 
 
-# ---------------- ПОИСК РЕСУРСОВ И ГЕНЕРАЦИЯ PNG ----------------
+# ---------------- ПОИСК РЕСУРСОВ И ОБЩИЕ ХЕЛПЕРЫ PNG ----------------
 
 def find_asset_ci(
     exact_names: tuple[str, ...],
@@ -795,7 +813,6 @@ def draw_ios_wifi(img: Image.Image, center_x: int, bottom_y: int) -> None:
 
 
 def draw_ios_battery(img: Image.Image, left_x: int, bottom_y: int, battery: int) -> None:
-    """Классическая иконка батареи iOS без цифр процентов."""
     scale = 4
     bat_w, bat_h = 72, 36
     cw, ch = 84, 42
@@ -882,7 +899,6 @@ def draw_checkmark(draw: ImageDraw.ImageDraw, x: int, y: int, color=(46, 158, 91
 
 
 def draw_verified_badge(size: int = 40) -> Image.Image:
-    """Зелёный кружок с белой галочкой подтверждения."""
     scale = 4
     s = size * scale
     badge = Image.new("RGBA", (s, s), (0, 0, 0, 0))
@@ -903,7 +919,6 @@ def draw_verified_badge(size: int = 40) -> Image.Image:
 
 
 def draw_ru_flag(width: int = 46, height: int = 32) -> Image.Image:
-    """Флаг России со скруглёнными углами."""
     scale = 4
     w, h = width * scale, height * scale
     flag = Image.new("RGBA", (w, h), (0, 0, 0, 0))
@@ -931,7 +946,6 @@ def draw_ru_flag(width: int = 46, height: int = 32) -> Image.Image:
 
 
 def draw_chevron_right(img: Image.Image, right_x: int, center_y: int) -> None:
-    """Тонкая серая стрелка '>' со сглаживанием."""
     scale = 4
     w, h = 22, 34
     layer = Image.new("RGBA", (w * scale, h * scale), (0, 0, 0, 0))
@@ -953,8 +967,7 @@ def draw_chevron_right(img: Image.Image, right_x: int, center_y: int) -> None:
 def get_status_time_str(ui_settings: dict) -> str:
     status_time = ui_settings.get("status_time", "auto")
     if status_time == "auto":
-        msk = timezone(timedelta(hours=3))
-        return datetime.now(msk).strftime("%H:%M")
+        return now_msk().strftime("%H:%M")
     return status_time
 
 
@@ -990,6 +1003,8 @@ def draw_sheet_header(
     draw.text((54, sheet_top + 172), title, fill=(17, 24, 39), font=font_title)
     return sheet_top
 
+
+# ---------------- ГЕНЕРАЦИЯ СКРИНШОТОВ ОПЕРАЦИЙ И ПРОФИЛЯ ----------------
 
 def build_screenshots(
     transfers: list[dict],
@@ -1115,7 +1130,6 @@ def build_screenshots(
 
 
 def build_profile_screenshot(profile: dict, ui_settings: dict) -> bytes:
-    """Генерирует PNG-скриншот страницы 'Настройки' профиля."""
     W, H = 1170, 2532
     img = Image.new("RGB", (W, H), (14, 16, 20))
     draw = ImageDraw.Draw(img)
@@ -1146,7 +1160,6 @@ def build_profile_screenshot(profile: dict, ui_settings: dict) -> bytes:
         verified: bool = False,
         show_flag: bool = False,
     ) -> None:
-        # Подпись слева
         lb = draw.textbbox((0, 0), label, font=font_label)
         lw, lh = lb[2] - lb[0], lb[3] - lb[1]
         draw.text(
@@ -1156,7 +1169,6 @@ def build_profile_screenshot(profile: dict, ui_settings: dict) -> bytes:
             font=font_label,
         )
 
-        # Стрелка '>' справа
         chev_right = card_x1 - 40
         draw_chevron_right(img, chev_right, y_center)
         right_cursor = chev_right - 46
@@ -1194,7 +1206,6 @@ def build_profile_screenshot(profile: dict, ui_settings: dict) -> bytes:
                 font=val_font,
             )
 
-    # --- Блок 1: Основные данные ---
     sec1_y = sheet_top + 296
     draw.text((card_x0, sec1_y), "Основные данные", fill=text_grey, font=font_section)
 
@@ -1223,7 +1234,6 @@ def build_profile_screenshot(profile: dict, ui_settings: dict) -> bytes:
         show_flag=True,
     )
 
-    # --- Блок 2: Контактные данные ---
     sec2_y = c1_y1 + 82
     draw.text((card_x0, sec2_y), "Контактные данные", fill=text_grey, font=font_section)
 
@@ -1248,7 +1258,6 @@ def build_profile_screenshot(profile: dict, ui_settings: dict) -> bytes:
         verified=bool(profile.get("email")),
     )
 
-    # Подпись под контактами (автоподбор размера, чтобы не вылезла за край)
     h1_part1 = "Для изменения подтвержденных данных "
     h1_part2 = "свяжитесь с нами"
     h1_size = 34
@@ -1264,7 +1273,6 @@ def build_profile_screenshot(profile: dict, ui_settings: dict) -> bytes:
     p1_w = draw.textbbox((0, 0), h1_part1, font=f_h1)[2]
     draw.text((card_x0 + p1_w, h1_y), h1_part2, fill=text_blue, font=f_h1)
 
-    # --- Блок 3: Безопасность ---
     sec3_y = h1_y + 114
     draw.text((card_x0, sec3_y), "Безопасность", fill=text_grey, font=font_section)
 
@@ -1284,6 +1292,572 @@ def build_profile_screenshot(profile: dict, ui_settings: dict) -> bytes:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
+
+
+# ---------------- ГЕНЕРАЦИЯ БЛАНКА КНД 1175018 (A4 PNG) ----------------
+
+def fmt_money_blank(val: float | str) -> str:
+    if isinstance(val, str):
+        return val.strip()
+    return f"{val:,.2f}".replace(",", " ")
+
+
+def fmt_int_blank(val: float | int | str) -> str:
+    if isinstance(val, str):
+        return val.strip()
+    return f"{int(round(val)):,}".replace(",", " ")
+
+
+def draw_dashed_line(
+    draw: ImageDraw.ImageDraw,
+    x0: int,
+    x1: int,
+    y: int,
+    color=(25, 25, 25),
+    width: int = 2,
+    dash: int = 7,
+    gap: int = 4,
+) -> None:
+    x = x0
+    while x < x1:
+        end = min(x + dash, x1)
+        draw.line([(x, y), (end, y)], fill=color, width=width)
+        x += dash + gap
+
+
+def draw_text_with_sup(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    text: str,
+    sup: str,
+    font_main,
+    font_sup,
+    color=(15, 15, 15),
+) -> int:
+    draw.text((x, y), text, fill=color, font=font_main)
+    tw = draw.textbbox((0, 0), text, font=font_main)[2]
+    if sup:
+        draw.text((x + tw + 1, y - 5), sup, fill=color, font=font_sup)
+        sw = draw.textbbox((0, 0), sup, font=font_sup)[2]
+        return x + tw + sw + 2
+    return x + tw
+
+
+def draw_fit_text_on_line(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    x0: int,
+    x1: int,
+    line_y: int,
+    base_size: int = 22,
+    bold: bool = False,
+    align: str = "center",
+    color=(15, 15, 15),
+) -> None:
+    if not text:
+        return
+    max_w = max(20, (x1 - x0) - 8)
+    size = base_size
+    f = load_font(size, bold=bold)
+    bb = draw.textbbox((0, 0), text, font=f)
+    while (bb[2] - bb[0]) > max_w and size > 13:
+        size -= 1
+        f = load_font(size, bold=bold)
+        bb = draw.textbbox((0, 0), text, font=f)
+    tw = bb[2] - bb[0]
+    th = bb[3] - bb[1]
+    if align == "left":
+        tx = x0 + 6
+    elif align == "right":
+        tx = x1 - tw - 6
+    else:
+        tx = x0 + (x1 - x0 - tw) / 2
+    ty = line_y - th - 5 - bb[1]
+    draw.text((tx, ty), text, fill=color, font=f)
+
+
+def draw_cell_text(
+    draw: ImageDraw.ImageDraw,
+    lines: list[str],
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    base_size: int = 20,
+    bold: bool = False,
+    align: str = "center",
+    pad_x: int = 8,
+    color=(15, 15, 15),
+) -> None:
+    non_empty = [ln for ln in lines if ln]
+    if not non_empty:
+        return
+    max_w = max(20, (x1 - x0) - 2 * pad_x)
+    size = base_size
+    f = load_font(size, bold=bold)
+    while size > 12:
+        widest = max(draw.textbbox((0, 0), ln, font=f)[2] for ln in non_empty)
+        if widest <= max_w:
+            break
+        size -= 1
+        f = load_font(size, bold=bold)
+
+    line_gap = 4
+    heights = []
+    bboxes = []
+    for ln in non_empty:
+        bb = draw.textbbox((0, 0), ln, font=f)
+        bboxes.append(bb)
+        heights.append(bb[3] - bb[1])
+
+    total_h = sum(heights) + line_gap * (len(non_empty) - 1)
+    cur_y = y0 + (y1 - y0 - total_h) / 2
+
+    for ln, bb, lh in zip(non_empty, bboxes, heights):
+        tw = bb[2] - bb[0]
+        if align == "left":
+            tx = x0 + pad_x
+        elif align == "right":
+            tx = x1 - pad_x - tw
+        else:
+            tx = x0 + (x1 - x0 - tw) / 2
+        draw.text((tx, cur_y - bb[1]), ln, fill=color, font=f)
+        cur_y += lh + line_gap
+
+
+def build_knd_1175018_png(data: dict) -> bytes:
+    """Отрисовывает заполненный бланк КНД 1175018 (A4, 1654x2339 px)."""
+    W, H = 1654, 2339
+    img = Image.new("RGB", (W, H), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    black = (18, 18, 18)
+    ML = 90
+    MR = 1564
+
+    f_app = load_font(17, bold=False)
+    f_knd = load_font(26, bold=True)
+    f_title = load_font(30, bold=True)
+    f_sub = load_font(23, bold=True)
+    f_sec = load_font(24, bold=True)
+    f_lbl = load_font(21, bold=False)
+    f_sup = load_font(13, bold=False)
+
+    # --- Шапка приложения справа сверху ---
+    app_x = 1235
+    draw.text((app_x, 78), "Приложение № 4", fill=black, font=f_app)
+    draw.text((app_x, 102), "к приказу ФНС России", fill=black, font=f_app)
+    draw.text((app_x, 126), "от 09.01.2024 № ЕД-7-11/1@", fill=black, font=f_app)
+
+    # --- Форма по КНД ---
+    draw.text((125, 174), "Форма по КНД 1175018", fill=black, font=f_knd)
+
+    # --- Главный заголовок ---
+    title = "СПРАВКА О ДОХОДАХ И СУММАХ НАЛОГА ФИЗИЧЕСКОГО ЛИЦА"
+    tb = draw.textbbox((0, 0), title, font=f_title)
+    draw.text(((W - (tb[2] - tb[0])) / 2, 224), title, fill=black, font=f_title)
+
+    # --- Строка "за ____ год от __.__.____" ---
+    year_str = data.get("year", str(now_msk().year))
+    issue_date = data.get("issue_date", now_msk().strftime("%d.%m.%Y"))
+    d_parts = issue_date.split(".") if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", issue_date) else ["", "", ""]
+
+    sy = 278
+    s_line_y = sy + 26
+    draw.text((590, sy), "за", fill=black, font=f_sub)
+    draw.line([(628, s_line_y), (722, s_line_y)], fill=black, width=2)
+    draw_fit_text_on_line(draw, year_str, 628, 722, s_line_y, base_size=22, bold=True)
+
+    draw.text((734, sy), "год", fill=black, font=f_sub)
+    draw.text((796, sy), "от", fill=black, font=f_sub)
+
+    draw.line([(836, s_line_y), (886, s_line_y)], fill=black, width=2)
+    draw_fit_text_on_line(draw, d_parts[0], 836, 886, s_line_y, base_size=22, bold=True)
+    draw.text((890, sy), ".", fill=black, font=f_sub)
+
+    draw.line([(902, s_line_y), (952, s_line_y)], fill=black, width=2)
+    draw_fit_text_on_line(draw, d_parts[1], 902, 952, s_line_y, base_size=22, bold=True)
+    draw.text((956, sy), ".", fill=black, font=f_sub)
+
+    draw.line([(968, s_line_y), (1064, s_line_y)], fill=black, width=2)
+    draw_fit_text_on_line(draw, d_parts[2], 968, 1064, s_line_y, base_size=22, bold=True)
+
+    # ================= РАЗДЕЛ 1 =================
+    draw.text((ML, 336), "1. Сведения о налоговом агенте", fill=black, font=f_sec)
+
+    # Строка 1.1: ОКТМО, Телефон, ИНН, КПП
+    y = 380
+    ly = y + 25
+    x_end = draw_text_with_sup(draw, ML, y, "Код по ОКТМО", "1", f_lbl, f_sup, black)
+    draw_dashed_line(draw, x_end + 8, 492, ly)
+    draw_fit_text_on_line(draw, data.get("oktmo", ""), x_end + 8, 492, ly, base_size=21)
+
+    draw.text((512, y), "Телефон", fill=black, font=f_lbl)
+    draw_dashed_line(draw, 610, 855, ly)
+    draw_fit_text_on_line(draw, data.get("agent_phone", ""), 610, 855, ly, base_size=21)
+
+    x_end = draw_text_with_sup(draw, 875, y, "ИНН", "2", f_lbl, f_sup, black)
+    draw_dashed_line(draw, x_end + 8, 1190, ly)
+    draw_fit_text_on_line(draw, data.get("agent_inn", ""), x_end + 8, 1190, ly, base_size=21)
+
+    x_end = draw_text_with_sup(draw, 1210, y, "КПП", "3", f_lbl, f_sup, black)
+    draw_dashed_line(draw, x_end + 8, MR, ly)
+    draw_fit_text_on_line(draw, data.get("agent_kpp", ""), x_end + 8, MR, ly, base_size=21)
+
+    # Строка 1.2: Налоговый агент
+    y = 424
+    ly = y + 25
+    draw.text((ML, y), "Налоговый агент", fill=black, font=f_lbl)
+    draw_dashed_line(draw, 282, MR, ly)
+    draw_fit_text_on_line(
+        draw, data.get("agent_name", ""), 282, MR, ly, base_size=22, align="left"
+    )
+
+    # Строка 1.3: Форма реорганизации
+    y = 468
+    ly = y + 25
+    draw.text((ML, y), "Форма реорганизации (ликвидация) (код)", fill=black, font=f_lbl)
+    draw_dashed_line(draw, 542, 650, ly)
+    draw_fit_text_on_line(draw, data.get("reorg_code", ""), 542, 650, ly, base_size=21)
+
+    # Строка 1.4: ИНН/КПП реорганизованной организации
+    y = 512
+    ly = y + 25
+    x1 = draw_text_with_sup(draw, ML, y, "ИНН", "2", f_lbl, f_sup, black)
+    x2 = draw_text_with_sup(draw, x1 + 2, y, "/КПП", "3", f_lbl, f_sup, black)
+    draw.text((x2 + 6, y), "реорганизованной организации", fill=black, font=f_lbl)
+    draw_dashed_line(draw, 542, 775, ly)
+    draw.text((783, y), "/", fill=black, font=f_lbl)
+    draw_dashed_line(draw, 800, 1020, ly)
+
+    # ================= РАЗДЕЛ 2 =================
+    draw.text(
+        (ML, 568),
+        "2. Сведения о физическом лице - получателе дохода",
+        fill=black,
+        font=f_sec,
+    )
+
+    # Строка 2.1: ИНН физлица
+    y = 612
+    ly = y + 25
+    x_end = draw_text_with_sup(draw, ML, y, "ИНН", "2", f_lbl, f_sup, black)
+    draw_dashed_line(draw, x_end + 10, 445, ly)
+    draw_fit_text_on_line(draw, data.get("person_inn", ""), x_end + 10, 445, ly, base_size=21)
+
+    # Строка 2.2: Фамилия, Имя, Отчество
+    y = 656
+    ly = y + 25
+    draw.text((ML, y), "Фамилия", fill=black, font=f_lbl)
+    draw_dashed_line(draw, 198, 610, ly)
+    draw_fit_text_on_line(draw, data.get("last_name", ""), 198, 610, ly, base_size=22)
+
+    draw.text((626, y), "Имя", fill=black, font=f_lbl)
+    draw_dashed_line(draw, 682, 1082, ly)
+    draw_fit_text_on_line(draw, data.get("first_name", ""), 682, 1082, ly, base_size=22)
+
+    x_end = draw_text_with_sup(draw, 1098, y, "Отчество", "4", f_lbl, f_sup, black)
+    draw_dashed_line(draw, x_end + 8, MR, ly)
+    draw_fit_text_on_line(draw, data.get("middle_name", ""), x_end + 8, MR, ly, base_size=22)
+
+    # Строка 2.3: Статус, Дата рождения, Гражданство
+    y = 700
+    ly = y + 25
+    draw.text((ML, y), "Статус налогоплательщика", fill=black, font=f_lbl)
+    draw_dashed_line(draw, 382, 466, ly)
+    draw_fit_text_on_line(draw, data.get("tax_status", ""), 382, 466, ly, base_size=21)
+
+    draw.text((494, y), "Дата рождения", fill=black, font=f_lbl)
+    dob = data.get("dob", "")
+    dob_parts = dob.split(".") if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", dob) else ["", "", ""]
+
+    draw_dashed_line(draw, 668, 718, ly)
+    draw_fit_text_on_line(draw, dob_parts[0], 668, 718, ly, base_size=21)
+    draw.text((721, y), ".", fill=black, font=f_lbl)
+
+    draw_dashed_line(draw, 732, 782, ly)
+    draw_fit_text_on_line(draw, dob_parts[1], 732, 782, ly, base_size=21)
+    draw.text((785, y), ".", fill=black, font=f_lbl)
+
+    draw_dashed_line(draw, 796, 892, ly)
+    draw_fit_text_on_line(draw, dob_parts[2], 796, 892, ly, base_size=21)
+
+    draw.text((922, y), "Гражданство (код страны)", fill=black, font=f_lbl)
+    draw_dashed_line(draw, 1212, 1345, ly)
+    draw_fit_text_on_line(draw, data.get("country_code", ""), 1212, 1345, ly, base_size=21)
+
+    # Строка 2.4: Код документа, Серия и номер
+    y = 744
+    ly = y + 25
+    draw.text((ML, y), "Код документа, удостоверяющего личность:", fill=black, font=f_lbl)
+    draw_dashed_line(draw, 558, 678, ly)
+    draw_fit_text_on_line(draw, data.get("doc_code", ""), 558, 678, ly, base_size=21)
+
+    draw.text((706, y), "Серия и номер документа", fill=black, font=f_lbl)
+    draw_dashed_line(draw, 992, MR, ly)
+    draw_fit_text_on_line(draw, data.get("doc_number", ""), 992, MR, ly, base_size=21)
+
+    # ================= РАЗДЕЛ 3 =================
+    y3 = 802
+    draw.text((ML, y3), "3. Доходы, облагаемые по ставке", fill=black, font=f_sec)
+    rate_ly = y3 + 27
+    draw_dashed_line(draw, 540, 622, rate_ly)
+    draw_fit_text_on_line(draw, str(data.get("tax_rate", "13")), 540, 622, rate_ly, base_size=22, bold=True)
+    draw.text((632, y3), "%", fill=black, font=f_sec)
+
+    # Две таблицы по 12 строк рядом
+    tbl3_top = 846
+    hdr3_h = 62
+    row3_h = 37
+    rows_per_side = 12
+    col3_widths = (94, 106, 200, 106, 209)  # сумма = 715
+    col3_headers = (
+        ["Месяц"],
+        ["Код", "дохода"],
+        ["Сумма дохода"],
+        ["Код", "вычета"],
+        ["Сумма вычета"],
+    )
+
+    incomes: list[dict] = data.get("incomes", [])
+    table_starts = (ML, ML + 715 + 44)  # 90 и 849 (правый край 1564)
+
+    for side_idx, tx0 in enumerate(table_starts):
+        tx1 = tx0 + sum(col3_widths)
+        ty_bottom = tbl3_top + hdr3_h + row3_h * rows_per_side
+
+        # Внешняя рамка
+        draw.rectangle([tx0, tbl3_top, tx1, ty_bottom], outline=black, width=2)
+        # Линия под шапкой
+        draw.line([(tx0, tbl3_top + hdr3_h), (tx1, tbl3_top + hdr3_h)], fill=black, width=2)
+        # Горизонтальные линии строк
+        for r in range(1, rows_per_side):
+            ry = tbl3_top + hdr3_h + r * row3_h
+            draw.line([(tx0, ry), (tx1, ry)], fill=black, width=2)
+
+        # Вертикальные линии и заголовки
+        cx = tx0
+        col_bounds: list[tuple[int, int]] = []
+        for c_idx, cw in enumerate(col3_widths):
+            col_bounds.append((cx, cx + cw))
+            if c_idx > 0:
+                draw.line([(cx, tbl3_top), (cx, ty_bottom)], fill=black, width=2)
+            draw_cell_text(
+                draw,
+                col3_headers[c_idx],
+                cx,
+                tbl3_top,
+                cx + cw,
+                tbl3_top + hdr3_h,
+                base_size=20,
+                bold=False,
+            )
+            cx += cw
+
+        # Заполнение данными
+        for r in range(rows_per_side):
+            rec_idx = side_idx * rows_per_side + r
+            if rec_idx >= len(incomes):
+                break
+            rec = incomes[rec_idx]
+            ry0 = tbl3_top + hdr3_h + r * row3_h
+            ry1 = ry0 + row3_h
+            vals = (
+                rec.get("month", ""),
+                rec.get("code", ""),
+                fmt_money_blank(rec["amount"]) if rec.get("amount") not in (None, "") else "",
+                rec.get("ded_code", ""),
+                fmt_money_blank(rec["ded_amount"]) if rec.get("ded_amount") not in (None, "", 0) else "",
+            )
+            aligns = ("center", "center", "right", "center", "right")
+            for c_idx, (bx0, bx1) in enumerate(col_bounds):
+                if vals[c_idx]:
+                    draw_cell_text(
+                        draw,
+                        [vals[c_idx]],
+                        bx0,
+                        ry0,
+                        bx1,
+                        ry1,
+                        base_size=20,
+                        align=aligns[c_idx],
+                        pad_x=10,
+                    )
+
+    # ================= РАЗДЕЛ 4 =================
+    y4 = 1392
+    draw.text(
+        (ML, y4),
+        "4. Стандартные, социальные и имущественные налоговые вычеты",
+        fill=black,
+        font=f_sec,
+    )
+
+    tbl4_top = y4 + 42
+    hdr4_h = 60
+    row4_h = 42
+    tbl4_bottom = tbl4_top + hdr4_h + row4_h
+    col4_widths = (118, 250, 118, 250, 118, 250, 118, 252)  # сумма = 1474
+
+    draw.rectangle([ML, tbl4_top, MR, tbl4_bottom], outline=black, width=2)
+    draw.line([(ML, tbl4_top + hdr4_h), (MR, tbl4_top + hdr4_h)], fill=black, width=2)
+
+    cx = ML
+    col4_bounds: list[tuple[int, int]] = []
+    for c_idx, cw in enumerate(col4_widths):
+        col4_bounds.append((cx, cx + cw))
+        if c_idx > 0:
+            draw.line([(cx, tbl4_top), (cx, tbl4_bottom)], fill=black, width=2)
+        hdr_lines = ["Код", "вычета"] if c_idx % 2 == 0 else ["Сумма вычета"]
+        draw_cell_text(draw, hdr_lines, cx, tbl4_top, cx + cw, tbl4_top + hdr4_h, base_size=20)
+        cx += cw
+
+    deductions: list[dict] = data.get("deductions", [])
+    for d_idx, ded in enumerate(deductions[:4]):
+        c_code = d_idx * 2
+        c_sum = d_idx * 2 + 1
+        bx0, bx1 = col4_bounds[c_code]
+        draw_cell_text(draw, [ded.get("code", "")], bx0, tbl4_top + hdr4_h, bx1, tbl4_bottom, base_size=20)
+        sx0, sx1 = col4_bounds[c_sum]
+        val_s = fmt_money_blank(ded["amount"]) if ded.get("amount") not in (None, "") else ""
+        draw_cell_text(draw, [val_s], sx0, tbl4_top + hdr4_h, sx1, tbl4_bottom, base_size=20, align="right", pad_x=12)
+
+    # ================= РАЗДЕЛ 5 =================
+    y5 = 1574
+    draw.text((ML, y5), "5. Общая сумма дохода и сумма налога", fill=black, font=f_sec)
+
+    tbl5_top = y5 + 42
+    row5_h = 68
+    tbl5_bottom = tbl5_top + row5_h * 4
+    c5_x = (ML, ML + 420, ML + 690, ML + 1204, MR)  # 420, 270, 514, 270
+
+    draw.rectangle([ML, tbl5_top, MR, tbl5_bottom], outline=black, width=2)
+    for r in range(1, 4):
+        ry = tbl5_top + r * row5_h
+        draw.line([(ML, ry), (MR, ry)], fill=black, width=2)
+    for vx in c5_x[1:-1]:
+        draw.line([(vx, tbl5_top), (vx, tbl5_bottom)], fill=black, width=2)
+
+    totals = data.get("totals", {})
+    sec5_rows = (
+        (
+            ["Общая сумма дохода"],
+            totals.get("total_income", ""),
+            ["Налоговая база"],
+            totals.get("tax_base", ""),
+        ),
+        (
+            ["Сумма налога исчисленная"],
+            totals.get("tax_calc", ""),
+            ["Сумма фиксированных авансовых", "платежей"],
+            totals.get("fixed_adv", ""),
+        ),
+        (
+            ["Сумма налога на прибыль", "организаций, подлежащая зачету"],
+            totals.get("profit_tax", ""),
+            ["Сумма налога, исчисленная и уплаченная в", "иностранном государстве"],
+            totals.get("foreign_tax", ""),
+        ),
+        (
+            ["Сумма налога удержанная"],
+            totals.get("tax_withheld", ""),
+            ["Сумма налога, излишне удержанная", "налоговым агентом"],
+            totals.get("tax_over", ""),
+        ),
+    )
+
+    for r_idx, (l_lbl, l_val, r_lbl, r_val) in enumerate(sec5_rows):
+        ry0 = tbl5_top + r_idx * row5_h
+        ry1 = ry0 + row5_h
+        draw_cell_text(draw, l_lbl, c5_x[0], ry0, c5_x[1], ry1, base_size=20, align="left", pad_x=14)
+        if l_val != "":
+            draw_cell_text(draw, [str(l_val)], c5_x[1], ry0, c5_x[2], ry1, base_size=21, align="right", pad_x=14)
+        draw_cell_text(draw, r_lbl, c5_x[2], ry0, c5_x[3], ry1, base_size=20, align="left", pad_x=14)
+        if r_val != "":
+            draw_cell_text(draw, [str(r_val)], c5_x[3], ry0, c5_x[4], ry1, base_size=21, align="right", pad_x=14)
+
+    # ================= РАЗДЕЛ 6 =================
+    y6 = 1928
+    draw.text(
+        (ML, y6),
+        "6. Сумма дохода, с которого не удержан налог налоговым агентом, и сумма неудержанного налога",
+        fill=black,
+        font=f_sec,
+    )
+
+    tbl6_top = y6 + 42
+    row6_h = 44
+    tbl6_bottom = tbl6_top + row6_h * 2
+    c6_mid = ML + 940
+
+    draw.rectangle([ML, tbl6_top, MR, tbl6_bottom], outline=black, width=2)
+    draw.line([(ML, tbl6_top + row6_h), (MR, tbl6_top + row6_h)], fill=black, width=2)
+    draw.line([(c6_mid, tbl6_top), (c6_mid, tbl6_bottom)], fill=black, width=2)
+
+    draw_cell_text(
+        draw,
+        ["Сумма дохода, с которого не удержан налог налоговым агентом"],
+        ML,
+        tbl6_top,
+        c6_mid,
+        tbl6_top + row6_h,
+        base_size=20,
+        align="left",
+        pad_x=14,
+    )
+    draw_cell_text(
+        draw,
+        ["Сумма неудержанного налога"],
+        ML,
+        tbl6_top + row6_h,
+        c6_mid,
+        tbl6_bottom,
+        base_size=20,
+        align="left",
+        pad_x=14,
+    )
+    if totals.get("unwithheld_income"):
+        draw_cell_text(
+            draw,
+            [str(totals["unwithheld_income"])],
+            c6_mid,
+            tbl6_top,
+            MR,
+            tbl6_top + row6_h,
+            base_size=21,
+            align="right",
+            pad_x=14,
+        )
+    if totals.get("unwithheld_tax"):
+        draw_cell_text(
+            draw,
+            [str(totals["unwithheld_tax"])],
+            c6_mid,
+            tbl6_top + row6_h,
+            MR,
+            tbl6_bottom,
+            base_size=21,
+            align="right",
+            pad_x=14,
+        )
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+# ---------------- КЛАВИАТУРЫ И ЛОГИКА ОПРОСНИКА БЛАНКА ----------------
+
+def build_start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Бланк (КНД 1175018)", callback_data="scr:blank"),
+                InlineKeyboardButton(text="Скриншот профиля", callback_data="scr:profile"),
+            ]
+        ]
+    )
 
 
 def build_action_keyboard(transfers: list[dict]) -> InlineKeyboardMarkup:
@@ -1317,9 +1891,8 @@ def build_action_keyboard(transfers: list[dict]) -> InlineKeyboardMarkup:
         )
     buttons.append(
         [
-            InlineKeyboardButton(
-                text="Скриншот профиля", callback_data="scr:profile"
-            )
+            InlineKeyboardButton(text="Скриншот профиля", callback_data="scr:profile"),
+            InlineKeyboardButton(text="Бланк", callback_data="scr:blank"),
         ]
     )
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1342,6 +1915,452 @@ def profile_prompt_text(profile: dict) -> str:
     )
 
 
+def parse_float_val(token: str) -> float:
+    cleaned = token.replace(" ", "").replace("\u00a0", "").replace(",", ".")
+    return float(cleaned)
+
+
+def parse_agent_details(text: str) -> dict[str, str]:
+    res = {"oktmo": "", "agent_phone": "", "agent_inn": "", "agent_kpp": ""}
+    raw_tokens = [t.strip() for t in re.split(r"[\n,;]+", text.strip()) if t.strip()]
+    if len(raw_tokens) == 1:
+        raw_tokens = raw_tokens[0].split()
+
+    if len(raw_tokens) == 4:
+        res["oktmo"] = "" if raw_tokens[0] == "-" else raw_tokens[0]
+        res["agent_phone"] = "" if raw_tokens[1] == "-" else raw_tokens[1]
+        res["agent_inn"] = "" if raw_tokens[2] == "-" else raw_tokens[2]
+        res["agent_kpp"] = "" if raw_tokens[3] == "-" else raw_tokens[3]
+        return res
+
+    for tok in raw_tokens:
+        if tok == "-":
+            continue
+        digits = re.sub(r"\D", "", tok)
+        if ("+" in tok or "(" in tok or "-" in tok) and len(digits) >= 10:
+            res["agent_phone"] = tok
+        elif len(digits) == 8 and not res["oktmo"]:
+            res["oktmo"] = digits
+        elif len(digits) == 9 and not res["agent_kpp"]:
+            res["agent_kpp"] = digits
+        elif len(digits) in (10, 12) and not res["agent_inn"]:
+            res["agent_inn"] = digits
+        elif len(digits) == 11 and digits.startswith(("7", "8")) and not res["agent_phone"]:
+            res["agent_phone"] = tok
+        elif len(digits) == 11 and not res["oktmo"]:
+            res["oktmo"] = digits
+        elif not res["oktmo"]:
+            res["oktmo"] = tok
+        elif not res["agent_phone"]:
+            res["agent_phone"] = tok
+        elif not res["agent_inn"]:
+            res["agent_inn"] = tok
+        elif not res["agent_kpp"]:
+            res["agent_kpp"] = tok
+
+    return res
+
+
+def parse_incomes_input(text: str) -> list[dict]:
+    records: list[dict] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.replace(";", " ").split()
+        if len(parts) < 3:
+            continue
+        m_part = parts[0]
+        code = parts[1]
+        try:
+            amount = parse_float_val(parts[2])
+        except ValueError:
+            continue
+
+        ded_code = parts[3] if len(parts) >= 4 else ""
+        ded_amount: float | str = ""
+        if len(parts) >= 5:
+            try:
+                ded_amount = parse_float_val(parts[4])
+            except ValueError:
+                ded_amount = parts[4]
+
+        range_m = re.fullmatch(r"(\d{1,2})\s*[-–]\s*(\d{1,2})", m_part)
+        if range_m:
+            m1, m2 = int(range_m.group(1)), int(range_m.group(2))
+            if 1 <= m1 <= m2 <= 12:
+                for m in range(m1, m2 + 1):
+                    records.append(
+                        {
+                            "month": f"{m:02d}",
+                            "code": code,
+                            "amount": amount,
+                            "ded_code": ded_code,
+                            "ded_amount": ded_amount,
+                        }
+                    )
+        elif m_part.isdigit() and 1 <= int(m_part) <= 12:
+            records.append(
+                {
+                    "month": f"{int(m_part):02d}",
+                    "code": code,
+                    "amount": amount,
+                    "ded_code": ded_code,
+                    "ded_amount": ded_amount,
+                }
+            )
+    return records[:24]
+
+
+def parse_deductions_input(text: str) -> list[dict]:
+    items: list[dict] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.replace(";", " ").split()
+        if len(parts) >= 2:
+            try:
+                val = parse_float_val(parts[1])
+            except ValueError:
+                val = parts[1]
+            items.append({"code": parts[0], "amount": val})
+    return items[:4]
+
+
+def compute_auto_totals(data: dict) -> dict[str, str]:
+    incomes = data.get("incomes", [])
+    deductions = data.get("deductions", [])
+    try:
+        rate = float(str(data.get("tax_rate", "13")).replace(",", "."))
+    except ValueError:
+        rate = 13.0
+
+    total_income = sum(
+        float(r["amount"]) for r in incomes if isinstance(r.get("amount"), (int, float))
+    )
+    row_deds = sum(
+        float(r["ded_amount"])
+        for r in incomes
+        if isinstance(r.get("ded_amount"), (int, float))
+    )
+    sec4_deds = sum(
+        float(d["amount"])
+        for d in deductions
+        if isinstance(d.get("amount"), (int, float))
+    )
+    tax_base = max(0.0, total_income - row_deds - sec4_deds)
+    tax_calc = round(tax_base * rate / 100.0)
+
+    return {
+        "total_income": fmt_money_blank(total_income),
+        "tax_base": fmt_money_blank(tax_base),
+        "tax_calc": fmt_int_blank(tax_calc),
+        "tax_withheld": fmt_int_blank(tax_calc),
+        "fixed_adv": "",
+        "profit_tax": "",
+        "foreign_tax": "",
+        "tax_over": "",
+        "unwithheld_income": "",
+        "unwithheld_tax": "",
+    }
+
+
+def get_blank_step_prompt(step_idx: int, data: dict) -> tuple[str, InlineKeyboardMarkup]:
+    step = BLANK_STEPS[step_idx]
+    total_steps = len(BLANK_STEPS)
+    header = f"<b>Бланк КНД 1175018 — шаг {step_idx + 1}/{total_steps}</b>\n\n"
+    profile = load_profile()
+    today_str = now_msk().strftime("%d.%m.%Y")
+    cur_year = str(now_msk().year)
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if step == "year_date":
+        text = (
+            header
+            + "Укажи <b>год</b> и <b>дату справки</b>.\n"
+            + f"Например: <code>{cur_year} {today_str}</code> или просто <code>{cur_year}</code>."
+        )
+        rows.append([InlineKeyboardButton(text=f"По умолчанию ({cur_year}, {today_str})", callback_data="blk:default")])
+
+    elif step == "agent_name":
+        text = (
+            header
+            + "<b>Налоговый агент</b> (название организации / ИП).\n"
+            + 'Например: <code>ООО «Ромашка»</code>'
+        )
+        rows.append([InlineKeyboardButton(text="Пропустить", callback_data="blk:skip")])
+
+    elif step == "agent_details":
+        text = (
+            header
+            + "<b>Реквизиты налогового агента:</b> ОКТМО, Телефон, ИНН, КПП.\n"
+            + "Введи через пробел или с новой строки (можно указать не все):\n"
+            + "<code>20701000 +74732000000 3662123456 366201001</code>"
+        )
+        rows.append([InlineKeyboardButton(text="Пропустить", callback_data="blk:skip")])
+
+    elif step == "fio":
+        saved_name = profile.get("name", "").strip()
+        text = (
+            header
+            + "<b>ФИО получателя дохода</b> (Фамилия Имя Отчество).\n"
+            + "Например: <code>Иванов Иван Иванович</code>"
+        )
+        if saved_name:
+            text += f"\n\nИз профиля/выписки: <code>{html.escape(saved_name)}</code>"
+            rows.append([InlineKeyboardButton(text=f"Оставить: {saved_name[:28]}", callback_data="blk:default")])
+
+    elif step == "person_inn":
+        text = (
+            header
+            + "<b>ИНН физического лица</b> (12 цифр).\n"
+            + "Например: <code>366212345678</code>"
+        )
+        rows.append([InlineKeyboardButton(text="Пропустить", callback_data="blk:skip")])
+
+    elif step == "person_meta":
+        saved_dob = profile.get("dob", "").strip()
+        text = (
+            header
+            + "<b>Статус налогоплательщика, дата рождения, код страны.</b>\n"
+            + "Например: <code>1 27.03.2006 643</code>\n"
+            + "(Можно ввести просто дату <code>27.03.2006</code> — статус <code>1</code> и код страны <code>643</code> подставятся сами.)"
+        )
+        if saved_dob:
+            rows.append([InlineKeyboardButton(text=f"1 / {saved_dob} / 643", callback_data="blk:default")])
+        else:
+            rows.append([InlineKeyboardButton(text="Только 1 и 643 (без даты)", callback_data="blk:default")])
+
+    elif step == "passport":
+        text = (
+            header
+            + "<b>Код документа и серия/номер паспорта.</b>\n"
+            + "Например: <code>21 2022 720045</code>\n"
+            + "(Можно ввести просто <code>2022 720045</code> — код <code>21</code> подставится сам.)"
+        )
+        rows.append([InlineKeyboardButton(text="Пропустить", callback_data="blk:skip")])
+
+    elif step == "tax_rate":
+        text = (
+            header
+            + "<b>Ставка налога (%)</b> для раздела 3.\n"
+            + "Введи число (например, <code>13</code> или <code>15</code>)."
+        )
+        rows.append([InlineKeyboardButton(text="13%", callback_data="blk:default")])
+
+    elif step == "incomes":
+        text = (
+            header
+            + "<b>Доходы по месяцам (раздел 3).</b>\n"
+            + "Формат строки: <code>Месяц КодДохода Сумма [КодВычета СуммаВычета]</code>\n\n"
+            + "Примеры:\n"
+            + "• Одинаковый доход с января по ноябрь:\n"
+            + "<code>01-11 2000 85000</code>\n"
+            + "• Разные суммы по месяцам (в одном сообщении):\n"
+            + "<code>01 2000 82000\n02 2000 85500\n03 2000 90000</code>"
+        )
+        rows.append([InlineKeyboardButton(text="Пропустить (пустая таблица)", callback_data="blk:skip")])
+
+    elif step == "deductions":
+        text = (
+            header
+            + "<b>Вычеты (раздел 4)</b> — если нужны.\n"
+            + "Формат: <code>КодВычета Сумма</code> (до 4 строк), например:\n"
+            + "<code>126 1400</code>"
+        )
+        rows.append([InlineKeyboardButton(text="Пропустить", callback_data="blk:skip")])
+
+    else:  # totals
+        auto_t = compute_auto_totals(data)
+        text = (
+            header
+            + "<b>Раздел 5 (общие суммы дохода и налога).</b>\n"
+            + f"Авторасчёт по разделу 3:\n"
+            + f"• Общая сумма дохода: <code>{auto_t['total_income']}</code>\n"
+            + f"• Налоговая база: <code>{auto_t['tax_base']}</code>\n"
+            + f"• Налог исчисленный / удержанный: <code>{auto_t['tax_calc']}</code>\n\n"
+            + "Нажми <b>«Авторасчёт»</b> или введи вручную 4 числа через пробел:\n"
+            + "<code>ОбщийДоход НалоговаяБаза Исчисленный Удержанный</code>"
+        )
+        rows.append([InlineKeyboardButton(text="Авторасчёт (готово)", callback_data="blk:default")])
+
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="blk:cancel")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_blank_step_or_finish(message: types.Message, user_id: int) -> None:
+    session = BLANK_SESSIONS.get(user_id)
+    if not session:
+        return
+
+    step_idx = session["step_idx"]
+    data = session["data"]
+
+    if step_idx >= len(BLANK_STEPS):
+        BLANK_SESSIONS.pop(user_id, None)
+        wait_msg = await message.answer("Формирую бланк КНД 1175018...")
+        try:
+            png_bytes = build_knd_1175018_png(data)
+            await message.answer_photo(
+                BufferedInputFile(png_bytes, filename="knd_1175018.png"),
+                caption="Готовый бланк КНД 1175018 (ниже файл в полном качестве A4 без сжатия).",
+            )
+            await message.answer_document(
+                BufferedInputFile(png_bytes, filename="knd_1175018.png"),
+                caption="Для нового бланка нажми /blank",
+            )
+            await wait_msg.delete()
+        except Exception as e:
+            logging.exception("Ошибка генерации бланка")
+            await wait_msg.edit_text(f"Ошибка при создании бланка: {e}")
+        return
+
+    text, kb = get_blank_step_prompt(step_idx, data)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+def apply_blank_step(session: dict, raw_text: str | None, action: str = "text") -> str | None:
+    """
+    Применяет ответ пользователя к текущему шагу.
+    Возвращает текст ошибки валидации или None при успехе.
+    """
+    step = BLANK_STEPS[session["step_idx"]]
+    data = session["data"]
+    profile = load_profile()
+    today_str = now_msk().strftime("%d.%m.%Y")
+    cur_year = str(now_msk().year)
+    text = (raw_text or "").strip()
+
+    if action == "skip" or text == "-":
+        if step == "year_date":
+            data["year"] = cur_year
+            data["issue_date"] = today_str
+        elif step == "tax_rate":
+            data["tax_rate"] = "13"
+        elif step == "totals":
+            data["totals"] = compute_auto_totals(data)
+        session["step_idx"] += 1
+        return None
+
+    if step == "year_date":
+        if action == "default":
+            data["year"] = cur_year
+            data["issue_date"] = today_str
+        else:
+            date_m = re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", text)
+            year_m = re.search(r"\b(19|20)\d{2}\b", text)
+            if not date_m and not year_m:
+                return "Укажи год (например, 2026) или год и дату (2026 27.11.2026)."
+            data["issue_date"] = date_m.group(0) if date_m else today_str
+            if year_m:
+                data["year"] = year_m.group(0)
+            else:
+                data["year"] = data["issue_date"].split(".")[-1]
+
+    elif step == "agent_name":
+        data["agent_name"] = text
+
+    elif step == "agent_details":
+        data.update(parse_agent_details(text))
+
+    elif step == "fio":
+        full_name = profile.get("name", "").strip() if action == "default" else text
+        parts = full_name.split()
+        if not parts:
+            return "Введи хотя бы фамилию и имя."
+        data["last_name"] = parts[0]
+        data["first_name"] = parts[1] if len(parts) >= 2 else ""
+        data["middle_name"] = " ".join(parts[2:]) if len(parts) >= 3 else ""
+
+    elif step == "person_inn":
+        digits = re.sub(r"\D", "", text)
+        if not digits:
+            return "Введи ИНН цифрами или нажми «Пропустить»."
+        data["person_inn"] = digits
+
+    elif step == "person_meta":
+        if action == "default":
+            data["tax_status"] = "1"
+            data["dob"] = profile.get("dob", "").strip()
+            data["country_code"] = "643"
+        else:
+            dob_m = re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", text)
+            rem = text
+            if dob_m:
+                data["dob"] = dob_m.group(0)
+                rem = rem[: dob_m.start()] + " " + rem[dob_m.end() :]
+            tokens = rem.split()
+            status = "1"
+            country = "643"
+            for tok in tokens:
+                d = re.sub(r"\D", "", tok)
+                if len(d) == 1:
+                    status = d
+                elif len(d) == 3:
+                    country = d
+            data["tax_status"] = status
+            data["country_code"] = country
+
+    elif step == "passport":
+        m_code = re.match(r"^(\d{2})\s+(.+)$", text)
+        if m_code:
+            data["doc_code"] = m_code.group(1)
+            data["doc_number"] = m_code.group(2).strip()
+        else:
+            data["doc_code"] = "21"
+            data["doc_number"] = text
+
+    elif step == "tax_rate":
+        if action == "default":
+            data["tax_rate"] = "13"
+        else:
+            cleaned = re.sub(r"[^\d.,]", "", text)
+            if not cleaned:
+                return "Введи ставку числом (например, 13)."
+            data["tax_rate"] = cleaned
+
+    elif step == "incomes":
+        recs = parse_incomes_input(text)
+        if not recs:
+            return (
+                "Не удалось распознать строки доходов.\n"
+                "Пример: <code>01-11 2000 85000</code> или <code>01 2000 85000</code>"
+            )
+        data["incomes"] = recs
+
+    elif step == "deductions":
+        deds = parse_deductions_input(text)
+        if not deds:
+            return "Формат: <code>126 1400</code> (код и сумма) или нажми «Пропустить»."
+        data["deductions"] = deds
+
+    elif step == "totals":
+        if action == "default" or text.lower() in ("авто", "auto"):
+            data["totals"] = compute_auto_totals(data)
+        else:
+            parts = text.replace(";", " ").split()
+            if len(parts) < 4:
+                return "Введи 4 числа (общий доход, база, исчисленный, удержанный) или нажми «Авторасчёт»."
+            try:
+                ti = fmt_money_blank(parse_float_val(parts[0]))
+                tb = fmt_money_blank(parse_float_val(parts[1]))
+                tc = fmt_int_blank(parse_float_val(parts[2]))
+                tw = fmt_int_blank(parse_float_val(parts[3]))
+            except ValueError:
+                return "Проверь числа — должно быть 4 значения через пробел."
+            data["totals"] = {
+                "total_income": ti,
+                "tax_base": tb,
+                "tax_calc": tc,
+                "tax_withheld": tw,
+            }
+
+    session["step_idx"] += 1
+    return None
+
+
 # ---------------- КОМАНДЫ И ОБРАБОТЧИКИ ----------------
 
 @dp.message(Command("start"))
@@ -1350,6 +2369,7 @@ async def cmd_start(message: types.Message):
         return
     if message.from_user:
         WAITING_PROFILE.discard(message.from_user.id)
+        BLANK_SESSIONS.pop(message.from_user.id, None)
     ui = load_ui_settings()
     sbp_p = get_sbp_asset_path()
     f_reg = get_font_asset_path(bold=False)
@@ -1367,6 +2387,7 @@ async def cmd_start(message: types.Message):
         f"Настройки скрина: домен `{ui['domain']}`, часы `{ui['status_time']}`, заряд `{ui['battery']}%`\n"
         f"{assets_info}\n\n"
         "Команды:\n"
+        "/blank — заполнить бланк справки о доходах (КНД 1175018)\n"
         "/profile — сделать скриншот профиля (Настройки)\n"
         "/domain 1wujym.life — сменить домен в строке браузера\n"
         "/status 22:21 76 — задать часы и уровень батареи (или /status auto 65)\n"
@@ -1374,7 +2395,18 @@ async def cmd_start(message: types.Message):
         "/exclude 1234567890 — добавить договор в исключения\n"
         "/unexclude 1234567890 — убрать из исключений",
         parse_mode="Markdown",
+        reply_markup=build_start_keyboard(),
     )
+
+
+@dp.message(Command("blank"))
+async def cmd_blank(message: types.Message):
+    if not is_allowed_user(message.from_user) or not message.from_user:
+        return
+    user_id = message.from_user.id
+    WAITING_PROFILE.discard(user_id)
+    BLANK_SESSIONS[user_id] = {"step_idx": 0, "data": {}}
+    await send_blank_step_or_finish(message, user_id)
 
 
 @dp.message(Command("profile"))
@@ -1382,6 +2414,7 @@ async def cmd_profile(message: types.Message):
     if not is_allowed_user(message.from_user):
         return
     if message.from_user:
+        BLANK_SESSIONS.pop(message.from_user.id, None)
         WAITING_PROFILE.add(message.from_user.id)
     profile = load_profile()
     await message.answer(profile_prompt_text(profile), parse_mode="Markdown")
@@ -1393,6 +2426,7 @@ async def cmd_cancel(message: types.Message):
         return
     if message.from_user:
         WAITING_PROFILE.discard(message.from_user.id)
+        BLANK_SESSIONS.pop(message.from_user.id, None)
     await message.answer("Отменено.")
 
 
@@ -1402,6 +2436,7 @@ async def cmd_domain(message: types.Message):
         return
     if message.from_user:
         WAITING_PROFILE.discard(message.from_user.id)
+        BLANK_SESSIONS.pop(message.from_user.id, None)
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
         await message.answer("Формат: /domain 1wujym.life")
@@ -1418,6 +2453,7 @@ async def cmd_status(message: types.Message):
         return
     if message.from_user:
         WAITING_PROFILE.discard(message.from_user.id)
+        BLANK_SESSIONS.pop(message.from_user.id, None)
     parts = (message.text or "").split()
     if len(parts) < 2:
         await message.answer("Формат: /status 22:21 76 (или /status auto 54)")
@@ -1479,6 +2515,7 @@ async def handle_pdf(message: types.Message, bot: Bot):
         return
     if message.from_user:
         WAITING_PROFILE.discard(message.from_user.id)
+        BLANK_SESSIONS.pop(message.from_user.id, None)
 
     doc = message.document
     if not doc or not (doc.file_name or "").lower().endswith(".pdf"):
@@ -1556,10 +2593,53 @@ async def handle_profile_button(callback: types.CallbackQuery):
         await callback.answer()
         return
 
-    WAITING_PROFILE.add(callback.from_user.id)
+    user_id = callback.from_user.id
+    BLANK_SESSIONS.pop(user_id, None)
+    WAITING_PROFILE.add(user_id)
     profile = load_profile()
     await callback.answer()
     await callback.message.answer(profile_prompt_text(profile), parse_mode="Markdown")
+
+
+@dp.callback_query(F.data == "scr:blank")
+async def handle_blank_button(callback: types.CallbackQuery):
+    if not is_allowed_user(callback.from_user):
+        await callback.answer()
+        return
+
+    user_id = callback.from_user.id
+    WAITING_PROFILE.discard(user_id)
+    BLANK_SESSIONS[user_id] = {"step_idx": 0, "data": {}}
+    await callback.answer()
+    await send_blank_step_or_finish(callback.message, user_id)
+
+
+@dp.callback_query(F.data.startswith("blk:"))
+async def handle_blank_callback(callback: types.CallbackQuery):
+    if not is_allowed_user(callback.from_user):
+        await callback.answer()
+        return
+
+    user_id = callback.from_user.id
+    action = callback.data.split(":", 1)[1]
+
+    if action == "cancel":
+        BLANK_SESSIONS.pop(user_id, None)
+        await callback.answer("Отменено")
+        await callback.message.answer("Заполнение бланка отменено.")
+        return
+
+    session = BLANK_SESSIONS.get(user_id)
+    if not session:
+        await callback.answer("Сессия истекла, нажми /blank заново.", show_alert=True)
+        return
+
+    await callback.answer()
+    err = apply_blank_step(session, None, action=action)
+    if err:
+        await callback.message.answer(err, parse_mode="HTML")
+        return
+    await send_blank_step_or_finish(callback.message, user_id)
 
 
 @dp.callback_query(F.data.startswith("scr:"))
@@ -1602,10 +2682,23 @@ async def handle_screenshots(callback: types.CallbackQuery):
 
 
 @dp.message(F.text)
-async def handle_profile_text(message: types.Message):
-    if not is_allowed_user(message.from_user):
+async def handle_text_input(message: types.Message):
+    if not is_allowed_user(message.from_user) or not message.from_user:
         return
-    if not message.from_user or message.from_user.id not in WAITING_PROFILE:
+    user_id = message.from_user.id
+
+    # 1. Активное заполнение бланка КНД 1175018
+    if user_id in BLANK_SESSIONS:
+        session = BLANK_SESSIONS[user_id]
+        err = apply_blank_step(session, message.text, action="text")
+        if err:
+            await message.answer(err, parse_mode="HTML")
+            return
+        await send_blank_step_or_finish(message, user_id)
+        return
+
+    # 2. Ввод данных для скриншота профиля
+    if user_id not in WAITING_PROFILE:
         return
 
     parsed = parse_profile_input(message.text or "")
@@ -1620,7 +2713,7 @@ async def handle_profile_text(message: types.Message):
     profile = load_profile()
     profile.update(parsed)
     save_profile(profile)
-    WAITING_PROFILE.discard(message.from_user.id)
+    WAITING_PROFILE.discard(user_id)
 
     try:
         ui = load_ui_settings()
