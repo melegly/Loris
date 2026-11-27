@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import io
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -15,7 +16,7 @@ from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboar
 import openpyxl
 from openpyxl.styles import Alignment, Font
 import pdfplumber
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 # --- НАСТРОЙКИ (задаются в "Переменных окружения" на хостинге) ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -413,53 +414,103 @@ def build_excel(rows: list[dict]) -> bytes:
     return output.getvalue()
 
 
-# ---------------- ГЕНЕРАЦИЯ PNG-СКРИНШОТОВ ----------------
+# ---------------- ПОИСК РЕСУРСОВ И ГЕНЕРАЦИЯ PNG ----------------
 
-def find_asset(*names: str) -> Path | None:
-    base_dirs = (Path("assets"), Path("."))
-    for d in base_dirs:
-        for name in names:
-            p = d / name
-            if p.exists() and p.is_file():
+def find_asset_ci(
+    exact_names: tuple[str, ...],
+    substrings: tuple[str, ...] = (),
+    exts: tuple[str, ...] = (),
+) -> Path | None:
+    """Ищет файл в ./assets и ./ без учёта регистра (важно для Linux/Bothost)."""
+    search_dirs = (Path("assets"), Path("."))
+    exact_lower = {name.lower() for name in exact_names}
+    exts_lower = {ext.lower() for ext in exts}
+
+    all_files: list[Path] = []
+    for d in search_dirs:
+        if d.exists() and d.is_dir():
+            for p in d.iterdir():
+                if p.is_file():
+                    all_files.append(p)
+
+    # 1. Точное совпадение без учёта регистра
+    for p in all_files:
+        if p.name.lower() in exact_lower:
+            return p
+
+    # 2. Поиск по части имени + расширению
+    if substrings:
+        for p in all_files:
+            if exts_lower and p.suffix.lower() not in exts_lower:
+                continue
+            stem_low = p.stem.lower()
+            if any(sub in stem_low for sub in substrings):
                 return p
+
     return None
 
 
-def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    if bold:
-        candidates = (
-            "font_bold.ttf",
-            "Inter-SemiBold.ttf",
-            "Inter-Bold.ttf",
-            "Roboto-Bold.ttf",
-            "Roboto-Medium.ttf",
-            "font_regular.ttf",
-        )
-        sys_candidates = (
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-        )
-    else:
-        candidates = (
-            "font_regular.ttf",
-            "Inter-Regular.ttf",
-            "Roboto-Regular.ttf",
-            "font_bold.ttf",
-        )
-        sys_candidates = (
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-        )
+def get_sbp_asset_path() -> Path | None:
+    return find_asset_ci(
+        exact_names=("sbp.png", "sbp_icon.png", "sbp.webp", "sbp.jpg", "sbp.jpeg"),
+        substrings=("sbp", "сбп"),
+        exts=(".png", ".webp", ".jpg", ".jpeg"),
+    )
 
-    asset_path = find_asset(*candidates)
+
+def get_card_asset_path() -> Path | None:
+    return find_asset_ci(
+        exact_names=("card.png", "card_icon.png", "card.webp"),
+        substrings=("card", "карт"),
+        exts=(".png", ".webp", ".jpg", ".jpeg"),
+    )
+
+
+def get_font_asset_path(bold: bool = False) -> Path | None:
+    if bold:
+        return find_asset_ci(
+            exact_names=(
+                "font_bold.ttf",
+                "inter-semibold.ttf",
+                "inter-bold.ttf",
+                "roboto-bold.ttf",
+                "roboto-medium.ttf",
+            ),
+            substrings=("semibold", "bold"),
+            exts=(".ttf", ".otf"),
+        )
+    return find_asset_ci(
+        exact_names=(
+            "font_regular.ttf",
+            "inter-regular.ttf",
+            "roboto-regular.ttf",
+        ),
+        substrings=("regular",),
+        exts=(".ttf", ".otf"),
+    )
+
+
+def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    asset_path = get_font_asset_path(bold=bold) or get_font_asset_path(bold=not bold)
     if asset_path:
         try:
             return ImageFont.truetype(str(asset_path), size)
         except Exception:
             pass
 
+    sys_candidates = (
+        (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        )
+        if bold
+        else (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        )
+    )
     for sys_path in sys_candidates:
         if Path(sys_path).exists():
             try:
@@ -484,78 +535,142 @@ def make_seconds(row: dict) -> str:
     return f"{base_time}:{sec:02d}"
 
 
-def draw_default_card_icon(size: int = 104) -> Image.Image:
-    icon = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+def draw_default_card_icon(size: int = 128) -> Image.Image:
+    scale = 2
+    s = size * scale
+    icon = Image.new("RGBA", (s, s), (0, 0, 0, 0))
     d = ImageDraw.Draw(icon)
-    # Синий корпус банковской карты
-    d.rounded_rectangle([4, 18, size - 4, size - 18], radius=14, fill=(32, 46, 82, 255))
-    # Светлая полоска / чип
-    d.rounded_rectangle([14, 34, 42, 46], radius=4, fill=(80, 102, 150, 255))
-    # Два перекрывающихся круга (красный и оранжевый)
-    r = 16
-    cy = size - 38
-    cx1 = size - 42
-    cx2 = size - 26
+    d.rounded_rectangle([8, 36, s - 8, s - 36], radius=28, fill=(32, 46, 82, 255))
+    d.rounded_rectangle([28, 68, 84, 92], radius=8, fill=(80, 102, 150, 255))
+    r = 32
+    cy = s - 76
+    cx1 = s - 84
+    cx2 = s - 52
     d.ellipse([cx1 - r, cy - r, cx1 + r, cy + r], fill=(235, 38, 42, 255))
     d.ellipse([cx2 - r, cy - r, cx2 + r, cy + r], fill=(247, 158, 27, 235))
-    return icon
+    return icon.resize((size, size), Image.Resampling.LANCZOS)
 
 
-def draw_default_sbp_icon(size: int = 104) -> Image.Image:
-    icon = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+def draw_default_sbp_icon() -> Image.Image:
+    w, h = 280, 120
+    icon = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     d = ImageDraw.Draw(icon)
-    d.rounded_rectangle([6, 16, size - 6, size - 16], radius=18, fill=(242, 244, 248, 255))
-    # Простые цветные треугольники в стиле СБП, если sbp.png ещё не загружен
-    d.polygon([(18, 28), (46, 52), (18, 76)], fill=(91, 45, 144, 255))
-    d.polygon([(28, 24), (56, 46), (34, 52)], fill=(250, 175, 24, 255))
-    d.polygon([(28, 80), (56, 58), (34, 52)], fill=(0, 166, 81, 255))
-    f = load_font(22, bold=True)
-    d.text((54, 39), "сбп", fill=(20, 24, 35, 255), font=f)
+    d.polygon([(12, 16), (68, 60), (12, 104)], fill=(91, 45, 144, 255))
+    d.polygon([(34, 8), (90, 50), (46, 60)], fill=(250, 175, 24, 255))
+    d.polygon([(34, 112), (90, 70), (46, 60)], fill=(0, 166, 81, 255))
+    f = load_font(56, bold=True)
+    d.text((108, 24), "сбп", fill=(20, 24, 35, 255), font=f)
     return icon
 
 
-def load_icon(kind: str, max_w: int = 114, max_h: int = 84) -> Image.Image:
-    if kind == "card":
-        p = find_asset("card.png", "card_icon.png")
-        if p:
-            raw = Image.open(p).convert("RGBA")
-        else:
-            raw = draw_default_card_icon()
-    else:
-        p = find_asset("sbp.png", "sbp_icon.png")
-        if p:
-            raw = Image.open(p).convert("RGBA")
-        else:
-            raw = draw_default_sbp_icon()
+def trim_icon_margins(raw: Image.Image) -> Image.Image:
+    """Аккуратно обрезает и прозрачные, и белые поля вокруг иконки."""
+    raw = raw.convert("RGBA")
 
-    bbox = raw.getbbox()
-    if bbox:
-        raw = raw.crop(bbox)
+    # 1. Сначала по альфа-каналу (не по RGB, чтобы игнорировать (255,255,255,0))
+    alpha_bbox = raw.getchannel("A").getbbox()
+    if alpha_bbox:
+        raw = raw.crop(alpha_bbox)
+
+    # 2. Накладываем на белый фон и обрезаем лишние белые поля вокруг логотипа
+    white_bg = Image.new("RGBA", raw.size, (255, 255, 255, 255))
+    flat = Image.alpha_composite(white_bg, raw).convert("RGB")
+    diff = ImageChops.difference(
+        flat, Image.new("RGB", flat.size, (255, 255, 255))
+    ).convert("L")
+    mask = diff.point(lambda p: 255 if p > 12 else 0)
+    content_bbox = mask.getbbox()
+    if content_bbox:
+        raw = raw.crop(content_bbox)
+
+    return raw
+
+
+def load_icon(kind: str, max_w: int = 142, max_h: int = 92) -> Image.Image:
+    if kind == "card":
+        p = get_card_asset_path()
+        raw = Image.open(p).convert("RGBA") if p else draw_default_card_icon()
+        max_w, max_h = 110, 82
+    else:
+        p = get_sbp_asset_path()
+        raw = Image.open(p).convert("RGBA") if p else draw_default_sbp_icon()
+
+    raw = trim_icon_margins(raw)
     raw.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
     return raw
 
 
-def draw_status_bar(draw: ImageDraw.ImageDraw, W: int, time_str: str, battery: int) -> None:
+def draw_ios_wifi(img: Image.Image, center_x: int, bottom_y: int) -> None:
+    """Рисует сглаженную иконку Wi-Fi в стиле iOS (точка + 2 скруглённые дуги)."""
+    scale = 4
+    w, h = 64, 48
+    cx = (w * scale) / 2
+    cy = (h - 7) * scale
+
+    final_mask = Image.new("L", (w * scale, h * scale), 0)
+    md = ImageDraw.Draw(final_mask)
+
+    # Нижняя точка
+    r_dot = 4.9 * scale
+    md.ellipse([cx - r_dot, cy - r_dot, cx + r_dot, cy + r_dot], fill=255)
+
+    # 2 толстые дуги со скруглёнными краями (как в iOS)
+    thickness = 6.2 * scale
+    half_t = thickness / 2
+    a1, a2 = 224, 316
+
+    for r_base in (14.8, 26.8):
+        r = r_base * scale
+        r_out = r + half_t
+        r_in = r - half_t
+
+        arc_mask = Image.new("L", final_mask.size, 0)
+        ad = ImageDraw.Draw(arc_mask)
+        ad.pieslice(
+            [cx - r_out, cy - r_out, cx + r_out, cy + r_out],
+            start=a1,
+            end=a2,
+            fill=255,
+        )
+        ad.ellipse(
+            [cx - r_in, cy - r_in, cx + r_in, cy + r_in],
+            fill=0,
+        )
+        for deg in (a1, a2):
+            rad = math.radians(deg)
+            ex = cx + r * math.cos(rad)
+            ey = cy + r * math.sin(rad)
+            ad.ellipse(
+                [ex - half_t, ey - half_t, ex + half_t, ey + half_t],
+                fill=255,
+            )
+        final_mask = ImageChops.lighter(final_mask, arc_mask)
+
+    wifi_rgba = Image.new("RGBA", final_mask.size, (255, 255, 255, 255))
+    wifi_rgba.putalpha(final_mask)
+    wifi_small = wifi_rgba.resize((w, h), Image.Resampling.LANCZOS)
+
+    img.paste(wifi_small, (int(center_x - w / 2), int(bottom_y - (h - 2))), wifi_small)
+
+
+def draw_status_bar(img: Image.Image, draw: ImageDraw.ImageDraw, W: int, time_str: str, battery: int) -> None:
     font_time = load_font(42, bold=True)
-    draw.text((160, 38), time_str, fill=(255, 255, 255), font=font_time)
+    draw.text((155, 38), time_str, fill=(255, 255, 255), font=font_time)
 
-    # Индикатор сигнала (4 столбика)
-    bx = W - 340
+    # Индикатор сигнала (4 столбика iOS)
+    bx = W - 322
     by_bottom = 80
-    heights = (14, 22, 30, 38)
+    heights = (13, 21, 29, 37)
     for i, h in enumerate(heights):
-        x0 = bx + i * 16
+        x0 = bx + i * 15
         fill = (255, 255, 255) if i < 3 else (110, 114, 122)
-        draw.rounded_rectangle([x0, by_bottom - h, x0 + 10, by_bottom], radius=3, fill=fill)
+        draw.rounded_rectangle([x0, by_bottom - h, x0 + 9, by_bottom], radius=3, fill=fill)
 
-    # Иконка Wi-Fi
-    wx, wy = W - 235, 76
-    draw.ellipse([wx - 5, wy - 5, wx + 5, wy + 5], fill=(255, 255, 255))
-    for r in (16, 28, 40):
-        draw.arc([wx - r, wy - r, wx + r, wy + r], start=225, end=315, fill=(255, 255, 255), width=5)
+    # Иконка Wi-Fi как на iPhone
+    draw_ios_wifi(img, center_x=W - 216, bottom_y=80)
 
     # Иконка батареи с процентом
-    bat_x, bat_y, bat_w, bat_h = W - 165, 42, 76, 38
+    bat_x, bat_y, bat_w, bat_h = W - 160, 43, 76, 37
     draw.rounded_rectangle(
         [bat_x, bat_y, bat_x + bat_w, bat_y + bat_h],
         radius=10,
@@ -563,7 +678,6 @@ def draw_status_bar(draw: ImageDraw.ImageDraw, W: int, time_str: str, battery: i
         width=3,
         fill=(45, 48, 54),
     )
-    # Контакт справа
     draw.rounded_rectangle(
         [bat_x + bat_w + 2, bat_y + 11, bat_x + bat_w + 8, bat_y + bat_h - 11],
         radius=3,
@@ -577,7 +691,7 @@ def draw_status_bar(draw: ImageDraw.ImageDraw, W: int, time_str: str, battery: i
         radius=7,
         fill=fill_color,
     )
-    font_bat = load_font(26, bold=True)
+    font_bat = load_font(25, bold=True)
     bat_text = str(pct)
     tb = draw.textbbox((0, 0), bat_text, font=font_bat)
     tw, th = tb[2] - tb[0], tb[3] - tb[1]
@@ -591,22 +705,18 @@ def draw_status_bar(draw: ImageDraw.ImageDraw, W: int, time_str: str, battery: i
 
 
 def draw_browser_bar(draw: ImageDraw.ImageDraw, W: int, domain: str) -> None:
-    # Серый овал адресной строки
     x0, y0, x1, y1 = 36, 136, W - 36, 246
     draw.rounded_rectangle([x0, y0, x1, y1], radius=55, fill=(58, 60, 66))
 
-    # Иконка камеры/объектива слева
     lx, ly = x0 + 48, (y0 + y1) // 2
     draw.rounded_rectangle([lx - 18, ly - 18, lx + 18, ly + 18], radius=7, outline=(215, 218, 224), width=4)
     draw.ellipse([lx - 6, ly - 6, lx + 6, ly + 6], fill=(215, 218, 224))
 
-    # Домен по центру
     font_dom = load_font(34, bold=False)
     tb = draw.textbbox((0, 0), domain, font=font_dom)
     tw, th = tb[2] - tb[0], tb[3] - tb[1]
     draw.text(((W - tw) / 2, (y0 + y1 - th) / 2 - tb[1]), domain, fill=(225, 228, 232), font=font_dom)
 
-    # Иконка "Поделиться" справа
     sx, sy = x1 - 52, (y0 + y1) // 2
     draw.rounded_rectangle([sx - 16, sy - 6, sx + 16, sy + 20], radius=4, outline=(215, 218, 224), width=4)
     draw.line([(sx, sy + 6), (sx, sy - 20)], fill=(215, 218, 224), width=4)
@@ -623,12 +733,6 @@ def build_screenshots(
     ui_settings: dict,
     per_page: int = 7,
 ) -> list[bytes]:
-    """
-    mode:
-      - 'deposits': исходящие из выписки (amount < 0) -> показываются как '+' Депозиты
-      - 'withdrawals': входящие из выписки (amount > 0) -> показываются как '-' Выводы
-      - 'all': все операции (исходящие -> '+', входящие -> '-')
-    """
     if mode == "deposits":
         filtered = [t for t in transfers if t["amount"] < 0]
         active_tab = "Депозиты"
@@ -650,15 +754,15 @@ def build_screenshots(
         msk = timezone(timedelta(hours=3))
         status_time = datetime.now(msk).strftime("%H:%M")
 
-    sbp_icon = load_icon("sbp")
-    card_icon = load_icon("card")
+    sbp_icon = load_icon("sbp", max_w=142, max_h=92)
+    card_icon = load_icon("card", max_w=110, max_h=82)
 
     font_back = load_font(40, bold=False)
     font_title = load_font(62, bold=True)
     font_tab = load_font(38, bold=True)
-    font_row_title = load_font(41, bold=True)
+    font_row_title = load_font(40, bold=True)
     font_status = load_font(33, bold=False)
-    font_amount = load_font(41, bold=True)
+    font_amount = load_font(40, bold=True)
     font_meta = load_font(32, bold=False)
 
     pages: list[bytes] = []
@@ -669,27 +773,22 @@ def build_screenshots(
         img = Image.new("RGB", (W, H), (14, 16, 20))
         draw = ImageDraw.Draw(img)
 
-        draw_status_bar(draw, W, status_time, battery)
+        draw_status_bar(img, draw, W, status_time, battery)
         draw_browser_bar(draw, W, domain)
 
-        # Белая подложка с закруглёнными верхними углами
         sheet_top = 285
         draw.rounded_rectangle([0, sheet_top, W, H + 80], radius=64, fill=(255, 255, 255))
 
-        # Кнопка "< Назад"
         bx, by = 64, sheet_top + 66
         draw.line([(bx + 18, by), (bx, by + 18), (bx + 18, by + 36)], fill=(27, 102, 224), width=6, joint="curve")
         draw.text((bx + 40, by - 6), "Назад", fill=(27, 102, 224), font=font_back)
 
-        # Крестик справа
         cx, cy = W - 82, sheet_top + 84
         draw.line([(cx - 18, cy - 18), (cx + 18, cy + 18)], fill=(45, 52, 66), width=5)
         draw.line([(cx + 18, cy - 18), (cx - 18, cy + 18)], fill=(45, 52, 66), width=5)
 
-        # Заголовок "История платежей"
         draw.text((56, sheet_top + 180), "История платежей", fill=(17, 24, 39), font=font_title)
 
-        # Переключатель вкладок: Все / Депозиты / Выводы
         tab_y0, tab_y1 = sheet_top + 305, sheet_top + 425
         tab_x0, tab_x1 = 56, W - 56
         draw.rounded_rectangle([tab_x0, tab_y0, tab_x1, tab_y1], radius=28, fill=(246, 247, 249))
@@ -714,20 +813,18 @@ def build_screenshots(
                 font=font_tab,
             )
 
-        # Отрисовка операций (до 7 на экран)
         list_top = tab_y1 + 48
         row_h = 248
 
         for i, row in enumerate(chunk):
             ry = list_top + i * row_h
 
-            # Инверсия: исходящий из выписки (<0) = Депозит (+), входящий (>0) = Вывод (-)
             is_deposit = row["amount"] < 0
             is_card = row["method"] == "По карте"
 
             icon = card_icon if is_card else sbp_icon
-            ix = 56 + (116 - icon.width) // 2
-            iy = ry + 64 + (84 - icon.height) // 2
+            ix = 46 + (142 - icon.width) // 2
+            iy = ry + 54 + (92 - icon.height) // 2
             img.paste(icon, (ix, iy), icon)
 
             if is_deposit:
@@ -745,17 +842,14 @@ def build_screenshots(
                 )
                 amount_str = format_rub(abs(row["amount"]), "-")
 
-            # Название (2 строки)
-            tx = 204
+            tx = 212
             draw.text((tx, ry + 24), title_lines[0], fill=(17, 24, 39), font=font_row_title)
-            draw.text((tx, ry + 78), title_lines[1], fill=(17, 24, 39), font=font_row_title)
+            draw.text((tx, ry + 76), title_lines[1], fill=(17, 24, 39), font=font_row_title)
 
-            # Статус "✓ Выполнено"
-            draw_checkmark(draw, tx + 2, ry + 144)
-            draw.text((tx + 42, ry + 140), "Выполнено", fill=(46, 158, 91), font=font_status)
+            draw_checkmark(draw, tx + 2, ry + 142)
+            draw.text((tx + 42, ry + 138), "Выполнено", fill=(46, 158, 91), font=font_status)
 
-            # Правая колонка: сумма, дата, время с секундами
-            right_x = W - 56
+            right_x = W - 52
 
             ab = draw.textbbox((0, 0), amount_str, font=font_amount)
             draw.text((right_x - (ab[2] - ab[0]), ry + 26), amount_str, fill=(17, 24, 39), font=font_amount)
@@ -814,11 +908,21 @@ async def cmd_start(message: types.Message):
     if not is_allowed_user(message.from_user):
         return
     ui = load_ui_settings()
+    sbp_p = get_sbp_asset_path()
+    f_reg = get_font_asset_path(bold=False)
+    f_bold = get_font_asset_path(bold=True)
+
+    assets_info = (
+        f"Файлы на сервере:\n"
+        f"• СБП: {sbp_p.name if sbp_p else 'НЕ НАЙДЕН (используется заглушка)'}\n"
+        f"• Шрифты: {f_reg.name if f_reg else 'системный'} / {f_bold.name if f_bold else 'системный'}"
+    )
     await message.answer(
         "Кидай PDF-выписку из Т-Банка — верну Excel и кнопки для генерации PNG-скриншотов.\n"
         "• Исходящие из выписки → Депозиты (+)\n"
         "• Входящие из выписки → Выводы (-)\n\n"
-        f"Текущие настройки скрина: домен `{ui['domain']}`, часы `{ui['status_time']}`, заряд `{ui['battery']}%`\n\n"
+        f"Настройки скрина: домен `{ui['domain']}`, часы `{ui['status_time']}`, заряд `{ui['battery']}%`\n"
+        f"{assets_info}\n\n"
         "Команды:\n"
         "/domain 1wujym.life — сменить домен в строке браузера\n"
         "/status 22:21 47 — задать часы и % батареи (или /status auto 65)\n"
@@ -939,84 +1043,4 @@ async def handle_pdf(message: types.Message, bot: Bot):
         incoming = [t for t in transfers if t["amount"] > 0]
         outgoing = [t for t in transfers if t["amount"] < 0]
 
-        total_in = sum(t["amount"] for t in incoming)
-        total_out = sum(t["amount"] for t in outgoing)
-        balance = total_in + total_out
-
-        method_counts = Counter(t["method"] for t in transfers)
-        methods_line = ", ".join(
-            f"{name} — {cnt}" for name, cnt in method_counts.most_common()
-        )
-
-        excel_bytes = build_excel(transfers)
-        out_name = f"transfers_{Path(doc.file_name).stem}.xlsx"
-
-        caption = (
-            f"Распознано переводов (всего): {total_recognized}\n"
-            f"Отсечено повторяющихся: {skipped_repeated}\n"
-            f"В таблице (разовых): {len(transfers)} ({methods_line})\n\n"
-            f"Входящие (→ Выводы): {len(incoming)} шт. (+{total_in:,.2f} ₽)\n"
-            f"Исходящие (→ Депозиты): {len(outgoing)} шт. ({total_out:,.2f} ₽)\n"
-            f"Разница: {balance:+,.2f} ₽"
-        ).replace(",", " ")
-
-        await message.answer_document(
-            BufferedInputFile(excel_bytes, filename=out_name),
-            caption=caption,
-            reply_markup=build_action_keyboard(transfers),
-        )
-        await wait_msg.delete()
-
-    except Exception as e:
-        logging.exception("Ошибка при разборе PDF")
-        await wait_msg.edit_text(f"Не удалось разобрать файл: {e}")
-
-
-@dp.callback_query(F.data.startswith("scr:"))
-async def handle_screenshots(callback: types.CallbackQuery):
-    if not is_allowed_user(callback.from_user):
-        await callback.answer()
-        return
-
-    user_id = callback.from_user.id
-    transfers = LAST_TRANSFERS.get(user_id)
-    if not transfers:
-        await callback.answer(
-            "Сначала закинь PDF-выписку заново (бот перезапускался).",
-            show_alert=True,
-        )
-        return
-
-    mode = callback.data.split(":", 1)[1]
-    labels = {"deposits": "Депозиты", "withdrawals": "Выводы", "all": "Все"}
-    label = labels.get(mode, "История")
-
-    await callback.answer(f"Генерирую скриншоты: {label}...")
-
-    try:
-        ui = load_ui_settings()
-        pages = build_screenshots(transfers, mode=mode, ui_settings=ui, per_page=7)
-        if not pages:
-            await callback.message.answer(f"Операций для вкладки «{label}» нет.")
-            return
-
-        total_pages = len(pages)
-        for idx, png_bytes in enumerate(pages, start=1):
-            await callback.message.answer_photo(
-                BufferedInputFile(png_bytes, filename=f"{mode}_{idx}.png"),
-                caption=f"{label} — скрин {idx}/{total_pages}",
-            )
-    except Exception as e:
-        logging.exception("Ошибка генерации PNG")
-        await callback.message.answer(f"Ошибка при создании PNG: {e}")
-
-
-async def main():
-    if not BOT_TOKEN:
-        raise ValueError("Не задан BOT_TOKEN в переменных окружения!")
-    bot = Bot(token=BOT_TOKEN)
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        total_in =
