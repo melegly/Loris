@@ -4,7 +4,6 @@ from datetime import datetime, timedelta, timezone
 import io
 import json
 import logging
-import math
 import os
 from pathlib import Path
 import re
@@ -33,7 +32,7 @@ UI_SETTINGS_FILE = Path("ui_settings.json")
 DEFAULT_UI_SETTINGS = {
     "domain": "1wujym.life",
     "status_time": "auto",  # "auto" или строка вида "22:21"
-    "battery": 47,
+    "battery": 76,
 }
 
 # Кэш последней разобранной выписки в памяти (по user_id)
@@ -421,7 +420,6 @@ def find_asset_ci(
     substrings: tuple[str, ...] = (),
     exts: tuple[str, ...] = (),
 ) -> Path | None:
-    """Ищет файл в ./assets и ./ без учёта регистра (важно для Linux/Bothost)."""
     search_dirs = (Path("assets"), Path("."))
     exact_lower = {name.lower() for name in exact_names}
     exts_lower = {ext.lower() for ext in exts}
@@ -433,12 +431,10 @@ def find_asset_ci(
                 if p.is_file():
                     all_files.append(p)
 
-    # 1. Точное совпадение без учёта регистра
     for p in all_files:
         if p.name.lower() in exact_lower:
             return p
 
-    # 2. Поиск по части имени + расширению
     if substrings:
         for p in all_files:
             if exts_lower and p.suffix.lower() not in exts_lower:
@@ -535,20 +531,40 @@ def make_seconds(row: dict) -> str:
     return f"{base_time}:{sec:02d}"
 
 
-def draw_default_card_icon(size: int = 128) -> Image.Image:
-    scale = 2
-    s = size * scale
-    icon = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    d = ImageDraw.Draw(icon)
-    d.rounded_rectangle([8, 36, s - 8, s - 36], radius=28, fill=(32, 46, 82, 255))
-    d.rounded_rectangle([28, 68, 84, 92], radius=8, fill=(80, 102, 150, 255))
-    r = 32
-    cy = s - 76
-    cx1 = s - 84
-    cx2 = s - 52
-    d.ellipse([cx1 - r, cy - r, cx1 + r, cy + r], fill=(235, 38, 42, 255))
-    d.ellipse([cx2 - r, cy - r, cx2 + r, cy + r], fill=(247, 158, 27, 235))
-    return icon.resize((size, size), Image.Resampling.LANCZOS)
+def draw_default_card_icon(width: int = 114, height: int = 80) -> Image.Image:
+    """Рисует значок карты как на примере: тёмно-синий корпус, полоса, золотой чип и 2 кружка."""
+    scale = 4
+    w, h = width * scale, height * scale
+    card = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(card, "RGBA")
+
+    radius = int(h * 0.16)
+    d.rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=(34, 44, 86, 255))
+
+    # Тёмная полоса сверху
+    d.rectangle([0, int(h * 0.20), w - 1, int(h * 0.37)], fill=(20, 27, 56, 255))
+
+    # Золотой чип слева снизу
+    d.rounded_rectangle(
+        [int(w * 0.11), int(h * 0.56), int(w * 0.33), int(h * 0.80)],
+        radius=int(h * 0.065),
+        fill=(238, 192, 86, 255),
+    )
+
+    # Перекрывающиеся красный и оранжевый кружки справа снизу
+    r = int(h * 0.165)
+    cy = int(h * 0.68)
+    cx1 = int(w * 0.65)
+    cx2 = int(w * 0.80)
+    d.ellipse([cx1 - r, cy - r, cx1 + r, cy + r], fill=(234, 42, 42, 255))
+    d.ellipse([cx2 - r, cy - r, cx2 + r, cy + r], fill=(242, 160, 44, 240))
+
+    # Чистая обрезка по скруглённым углам карты
+    mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=255)
+    card.putalpha(mask)
+
+    return card.resize((width, height), Image.Resampling.LANCZOS)
 
 
 def draw_default_sbp_icon() -> Image.Image:
@@ -564,15 +580,12 @@ def draw_default_sbp_icon() -> Image.Image:
 
 
 def trim_icon_margins(raw: Image.Image) -> Image.Image:
-    """Аккуратно обрезает и прозрачные, и белые поля вокруг иконки."""
     raw = raw.convert("RGBA")
 
-    # 1. Сначала по альфа-каналу (не по RGB, чтобы игнорировать (255,255,255,0))
     alpha_bbox = raw.getchannel("A").getbbox()
     if alpha_bbox:
         raw = raw.crop(alpha_bbox)
 
-    # 2. Накладываем на белый фон и обрезаем лишние белые поля вокруг логотипа
     white_bg = Image.new("RGBA", raw.size, (255, 255, 255, 255))
     flat = Image.alpha_composite(white_bg, raw).convert("RGB")
     diff = ImageChops.difference(
@@ -589,43 +602,72 @@ def trim_icon_margins(raw: Image.Image) -> Image.Image:
 def load_icon(kind: str, max_w: int = 142, max_h: int = 92) -> Image.Image:
     if kind == "card":
         p = get_card_asset_path()
-        raw = Image.open(p).convert("RGBA") if p else draw_default_card_icon()
-        max_w, max_h = 110, 82
-    else:
-        p = get_sbp_asset_path()
-        raw = Image.open(p).convert("RGBA") if p else draw_default_sbp_icon()
+        if p:
+            raw = trim_icon_margins(Image.open(p).convert("RGBA"))
+            raw.thumbnail((114, 80), Image.Resampling.LANCZOS)
+            return raw
+        return draw_default_card_icon(114, 80)
 
+    p = get_sbp_asset_path()
+    raw = Image.open(p).convert("RGBA") if p else draw_default_sbp_icon()
     raw = trim_icon_margins(raw)
     raw.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
     return raw
 
 
-def draw_ios_wifi(img: Image.Image, center_x: int, bottom_y: int) -> None:
-    """Рисует сглаженную иконку Wi-Fi в стиле iOS (точка + 2 скруглённые дуги)."""
+def draw_ios_signal(img: Image.Image, left_x: int, bottom_y: int) -> None:
+    """Рисует 4 белых скруглённых столбика сети iOS."""
     scale = 4
-    w, h = 64, 48
-    cx = (w * scale) / 2
-    cy = (h - 7) * scale
+    w, h = 56, 40
+    layer = Image.new("RGBA", (w * scale, h * scale), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
 
-    final_mask = Image.new("L", (w * scale, h * scale), 0)
-    md = ImageDraw.Draw(final_mask)
+    bar_w = 9 * scale
+    gap = 6 * scale
+    heights = (13, 20, 28, 36)
+    base_y = (h - 2) * scale
 
-    # Нижняя точка
-    r_dot = 4.9 * scale
-    md.ellipse([cx - r_dot, cy - r_dot, cx + r_dot, cy + r_dot], fill=255)
+    for i, bh in enumerate(heights):
+        x0 = i * (bar_w + gap)
+        y0 = base_y - bh * scale
+        d.rounded_rectangle(
+            [x0, y0, x0 + bar_w, base_y],
+            radius=bar_w // 2,
+            fill=(255, 255, 255, 255),
+        )
 
-    # 2 толстые дуги со скруглёнными краями (как в iOS)
-    thickness = 6.2 * scale
-    half_t = thickness / 2
-    a1, a2 = 224, 316
+    small = layer.resize((w, h), Image.Resampling.LANCZOS)
+    img.paste(small, (left_x, bottom_y - (h - 2)), small)
 
-    for r_base in (14.8, 26.8):
-        r = r_base * scale
-        r_out = r + half_t
-        r_in = r - half_t
 
-        arc_mask = Image.new("L", final_mask.size, 0)
-        ad = ImageDraw.Draw(arc_mask)
+def draw_ios_wifi(img: Image.Image, center_x: int, bottom_y: int) -> None:
+    """Рисует иконку Wi-Fi iOS: нижний сектор + 2 толстые сглаженные дуги."""
+    scale = 6
+    w, h = 56, 42
+    W_s, H_s = w * scale, h * scale
+    cx = W_s / 2
+    cy = (h - 4.0) * scale
+
+    mask = Image.new("L", (W_s, H_s), 0)
+    md = ImageDraw.Draw(mask)
+
+    a1, a2 = 226, 314
+
+    # Нижний сплошной сектор-капля
+    r0 = 10.6 * scale
+    md.pieslice([cx - r0, cy - r0, cx + r0, cy + r0], start=a1, end=a2, fill=255)
+    r_tip = 2.0 * scale
+    md.ellipse(
+        [cx - r_tip, cy - r_tip * 1.4, cx + r_tip, cy + r_tip * 0.6],
+        fill=255,
+    )
+
+    # Две толстые дуги
+    for r_in_base, r_out_base in ((16.2, 23.0), (28.6, 35.4)):
+        r_in = r_in_base * scale
+        r_out = r_out_base * scale
+        arc_layer = Image.new("L", (W_s, H_s), 0)
+        ad = ImageDraw.Draw(arc_layer)
         ad.pieslice(
             [cx - r_out, cy - r_out, cx + r_out, cy + r_out],
             start=a1,
@@ -636,72 +678,81 @@ def draw_ios_wifi(img: Image.Image, center_x: int, bottom_y: int) -> None:
             [cx - r_in, cy - r_in, cx + r_in, cy + r_in],
             fill=0,
         )
-        for deg in (a1, a2):
-            rad = math.radians(deg)
-            ex = cx + r * math.cos(rad)
-            ey = cy + r * math.sin(rad)
-            ad.ellipse(
-                [ex - half_t, ey - half_t, ex + half_t, ey + half_t],
-                fill=255,
-            )
-        final_mask = ImageChops.lighter(final_mask, arc_mask)
+        mask = ImageChops.lighter(mask, arc_layer)
 
-    wifi_rgba = Image.new("RGBA", final_mask.size, (255, 255, 255, 255))
-    wifi_rgba.putalpha(final_mask)
+    wifi_rgba = Image.new("RGBA", (W_s, H_s), (255, 255, 255, 255))
+    wifi_rgba.putalpha(mask)
     wifi_small = wifi_rgba.resize((w, h), Image.Resampling.LANCZOS)
 
-    img.paste(wifi_small, (int(center_x - w / 2), int(bottom_y - (h - 2))), wifi_small)
+    img.paste(wifi_small, (int(center_x - w / 2), int(bottom_y - 39)), wifi_small)
+
+
+def draw_ios_battery(img: Image.Image, left_x: int, bottom_y: int, battery: int) -> None:
+    """Рисует сплошную iOS-батарею с процентами (как на примере 76)."""
+    scale = 4
+    bat_w, bat_h = 74, 37
+    cw, ch = 84, 42
+    W_s, H_s = cw * scale, ch * scale
+    top_pad = 2 * scale
+    radius = 11 * scale
+
+    pct = max(5, min(100, int(battery)))
+
+    pill_mask = Image.new("L", (W_s, H_s), 0)
+    ImageDraw.Draw(pill_mask).rounded_rectangle(
+        [0, top_pad, bat_w * scale, top_pad + bat_h * scale],
+        radius=radius,
+        fill=255,
+    )
+
+    fill_layer = Image.new("RGBA", (W_s, H_s), (122, 124, 130, 255))
+    fd = ImageDraw.Draw(fill_layer)
+    fill_w = int(bat_w * scale * pct / 100)
+    fill_color = (255, 255, 255, 255) if pct > 20 else (255, 69, 58, 255)
+    fd.rectangle([0, 0, fill_w, H_s], fill=fill_color)
+
+    bat_img = Image.new("RGBA", (W_s, H_s), (0, 0, 0, 0))
+    bat_img.paste(fill_layer, (0, 0), pill_mask)
+
+    bd = ImageDraw.Draw(bat_img, "RGBA")
+
+    # Цифры процентов по центру капсулы
+    font_bat = load_font(27 * scale, bold=True)
+    bat_text = str(pct)
+    tb = bd.textbbox((0, 0), bat_text, font=font_bat)
+    tw, th = tb[2] - tb[0], tb[3] - tb[1]
+    txt_color = (14, 16, 20, 255) if pct > 20 else (255, 255, 255, 255)
+    tx = (bat_w * scale - tw) / 2 - tb[0]
+    ty = top_pad + (bat_h * scale - th) / 2 - tb[1]
+    bd.text((tx, ty), bat_text, fill=txt_color, font=font_bat)
+
+    # Контакт-выступ справа (D-форма)
+    nub_x0 = int((bat_w + 3.0) * scale)
+    nub_x1 = int((bat_w + 7.5) * scale)
+    nub_h = 13 * scale
+    nub_y0 = int(top_pad + (bat_h * scale - nub_h) / 2)
+    nub_y1 = nub_y0 + nub_h
+    bd.pieslice(
+        [nub_x0 - int(4.5 * scale), nub_y0, nub_x1, nub_y1],
+        start=270,
+        end=90,
+        fill=(122, 124, 130, 255),
+    )
+
+    small = bat_img.resize((cw, ch), Image.Resampling.LANCZOS)
+    img.paste(small, (left_x, bottom_y - bat_h - 2), small)
 
 
 def draw_status_bar(img: Image.Image, draw: ImageDraw.ImageDraw, W: int, time_str: str, battery: int) -> None:
     font_time = load_font(42, bold=True)
-    draw.text((155, 38), time_str, fill=(255, 255, 255), font=font_time)
+    tb = draw.textbbox((0, 0), time_str, font=font_time)
+    th = tb[3] - tb[1]
+    draw.text((135, 62 - th / 2 - tb[1]), time_str, fill=(255, 255, 255), font=font_time)
 
-    # Индикатор сигнала (4 столбика iOS)
-    bx = W - 322
-    by_bottom = 80
-    heights = (13, 21, 29, 37)
-    for i, h in enumerate(heights):
-        x0 = bx + i * 15
-        fill = (255, 255, 255) if i < 3 else (110, 114, 122)
-        draw.rounded_rectangle([x0, by_bottom - h, x0 + 9, by_bottom], radius=3, fill=fill)
-
-    # Иконка Wi-Fi как на iPhone
-    draw_ios_wifi(img, center_x=W - 216, bottom_y=80)
-
-    # Иконка батареи с процентом
-    bat_x, bat_y, bat_w, bat_h = W - 160, 43, 76, 37
-    draw.rounded_rectangle(
-        [bat_x, bat_y, bat_x + bat_w, bat_y + bat_h],
-        radius=10,
-        outline=(155, 158, 165),
-        width=3,
-        fill=(45, 48, 54),
-    )
-    draw.rounded_rectangle(
-        [bat_x + bat_w + 2, bat_y + 11, bat_x + bat_w + 8, bat_y + bat_h - 11],
-        radius=3,
-        fill=(155, 158, 165),
-    )
-    pct = max(5, min(100, int(battery)))
-    fill_w = int((bat_w - 8) * pct / 100)
-    fill_color = (255, 255, 255) if pct > 20 else (239, 68, 68)
-    draw.rounded_rectangle(
-        [bat_x + 4, bat_y + 4, bat_x + 4 + fill_w, bat_y + bat_h - 4],
-        radius=7,
-        fill=fill_color,
-    )
-    font_bat = load_font(25, bold=True)
-    bat_text = str(pct)
-    tb = draw.textbbox((0, 0), bat_text, font=font_bat)
-    tw, th = tb[2] - tb[0], tb[3] - tb[1]
-    txt_color = (18, 20, 24) if pct >= 40 else (255, 255, 255)
-    draw.text(
-        (bat_x + (bat_w - tw) / 2, bat_y + (bat_h - th) / 2 - tb[1]),
-        bat_text,
-        fill=txt_color,
-        font=font_bat,
-    )
+    bottom_y = 80
+    draw_ios_signal(img, left_x=W - 296, bottom_y=bottom_y)
+    draw_ios_wifi(img, center_x=W - 199, bottom_y=bottom_y)
+    draw_ios_battery(img, left_x=W - 156, bottom_y=bottom_y, battery=battery)
 
 
 def draw_browser_bar(draw: ImageDraw.ImageDraw, W: int, domain: str) -> None:
@@ -748,14 +799,14 @@ def build_screenshots(
 
     W, H = 1170, 2532
     domain = ui_settings.get("domain", "1wujym.life")
-    battery = int(ui_settings.get("battery", 47))
+    battery = int(ui_settings.get("battery", 76))
     status_time = ui_settings.get("status_time", "auto")
     if status_time == "auto":
         msk = timezone(timedelta(hours=3))
         status_time = datetime.now(msk).strftime("%H:%M")
 
     sbp_icon = load_icon("sbp", max_w=142, max_h=92)
-    card_icon = load_icon("card", max_w=110, max_h=82)
+    card_icon = load_icon("card", max_w=114, max_h=80)
 
     font_back = load_font(40, bold=False)
     font_title = load_font(62, bold=True)
@@ -925,7 +976,7 @@ async def cmd_start(message: types.Message):
         f"{assets_info}\n\n"
         "Команды:\n"
         "/domain 1wujym.life — сменить домен в строке браузера\n"
-        "/status 22:21 47 — задать часы и % батареи (или /status auto 65)\n"
+        "/status 22:21 76 — задать часы и % батареи (или /status auto 65)\n"
         "/excluded — список игнорируемых договоров\n"
         "/exclude 1234567890 — добавить договор в исключения\n"
         "/unexclude 1234567890 — убрать из исключений",
@@ -953,7 +1004,7 @@ async def cmd_status(message: types.Message):
         return
     parts = (message.text or "").split()
     if len(parts) < 2:
-        await message.answer("Формат: /status 22:21 47 (или /status auto 54)")
+        await message.answer("Формат: /status 22:21 76 (или /status auto 54)")
         return
     ui = load_ui_settings()
     t_val = parts[1].strip()
