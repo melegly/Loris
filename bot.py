@@ -1,5 +1,6 @@
 import asyncio
 from collections import Counter
+import copy
 from datetime import datetime, timedelta, timezone
 import html
 import io
@@ -32,6 +33,7 @@ EXCLUDED_FILE = Path("excluded_contracts.json")
 UI_SETTINGS_FILE = Path("ui_settings.json")
 PROFILE_FILE = Path("profile_settings.json")
 EP_SETTINGS_FILE = Path("ep_settings.json")
+AGENTS_FILE = Path("agents_templates.json")
 
 DEFAULT_UI_SETTINGS = {
     "domain": "1wujym.life",
@@ -42,6 +44,7 @@ DEFAULT_UI_SETTINGS = {
 DEFAULT_PROFILE = {
     "name": "",
     "dob": "",
+    "passport": "",
     "country": "Россия",
     "phone": "",
     "email": "",
@@ -57,11 +60,17 @@ DEFAULT_EP = {
     "position": "center",  # "left", "center", "right"
 }
 
-# Кэш последней выписки, последнего бланка и активных сессий ввода (по user_id)
+# Кэш операций, бланков и активных режимов ввода (по user_id)
 LAST_TRANSFERS: dict[int, list[dict]] = {}
-LAST_BLANK_IMAGE: dict[int, bytes] = {}
+LAST_TRANSFERS_ORIG: dict[int, list[dict]] = {}
+LAST_PDF_STEM: dict[int, str] = {}
+LAST_BLANK_PAGES: dict[int, list[bytes]] = {}
 LAST_BLANK_META: dict[int, dict] = {}
+LAST_SIGNED_PNG: dict[int, bytes] = {}
+
 WAITING_PROFILE: set[int] = set()
+WAITING_AGENT_ADD: set[int] = set()
+EDIT_MODE: dict[int, str] = {}
 BLANK_SESSIONS: dict[int, dict] = {}
 EP_SESSIONS: dict[int, dict] = {}
 
@@ -102,7 +111,7 @@ logging.basicConfig(level=logging.INFO)
 dp = Dispatcher()
 
 
-# ---------------- ХРАНЕНИЕ НАСТРОЕК ----------------
+# ---------------- ХРАНЕНИЕ НАСТРОЕК И ШАБЛОНОВ ----------------
 
 def load_excluded() -> set[str]:
     if EXCLUDED_FILE.exists():
@@ -180,6 +189,45 @@ def save_ep_settings(ep: dict) -> None:
     )
 
 
+def load_agents() -> list[dict]:
+    if AGENTS_FILE.exists():
+        try:
+            data = json.loads(AGENTS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+    return []
+
+
+def save_agents(agents: list[dict]) -> None:
+    AGENTS_FILE.write_text(
+        json.dumps(agents, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def upsert_agent_template(agent_data: dict) -> dict:
+    agents = load_agents()
+    name = (agent_data.get("agent_name") or "").strip()
+    name_low = name.lower()
+    existing = next(
+        (a for a in agents if (a.get("agent_name") or "").strip().lower() == name_low),
+        None,
+    )
+    if existing:
+        existing.update(agent_data)
+        save_agents(agents)
+        return existing
+
+    new_id = secrets.token_hex(3)
+    entry = dict(agent_data)
+    entry["id"] = new_id
+    agents.append(entry)
+    save_agents(agents)
+    return entry
+
+
 def generate_cert_hex() -> str:
     return secrets.token_hex(16).upper()
 
@@ -188,6 +236,8 @@ def clear_active_inputs(user_id: int | None) -> None:
     if user_id is None:
         return
     WAITING_PROFILE.discard(user_id)
+    WAITING_AGENT_ADD.discard(user_id)
+    EDIT_MODE.pop(user_id, None)
     BLANK_SESSIONS.pop(user_id, None)
     EP_SESSIONS.pop(user_id, None)
 
@@ -202,7 +252,59 @@ def now_msk() -> datetime:
     return datetime.now(timezone(timedelta(hours=3)))
 
 
-# ---------------- РАЗБОР PDF Т-БАНКА ----------------
+# ---------------- РАЗБОР PDF Т-БАНКА И ОПРЕДЕЛЕНИЕ ТИПА PDF ----------------
+
+def is_tbank_statement_pdf(pdf_bytes: bytes) -> bool:
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            if not pdf.pages:
+                return False
+            text = (pdf.pages[0].extract_text() or "").lower()
+            if "справка о движении" in text:
+                return True
+            if "движение средств" in text and any(
+                k in text for k in ("тбанк", "тинькофф", "tbank")
+            ):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def render_pdf_to_png_pages(pdf_bytes: bytes, resolution: int = 200) -> list[bytes]:
+    pages_png: list[bytes] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            pil_img = page.to_image(resolution=resolution).original.convert("RGB")
+            buf = io.BytesIO()
+            pil_img.save(buf, format="PNG")
+            pages_png.append(buf.getvalue())
+    return pages_png
+
+
+def images_to_pdf_bytes(png_list: list[bytes], resolution: float = 200.0) -> bytes:
+    imgs: list[Image.Image] = []
+    for b in png_list:
+        raw = Image.open(io.BytesIO(b))
+        if raw.mode in ("RGBA", "LA") or (
+            raw.mode == "P" and "transparency" in raw.info
+        ):
+            bg = Image.new("RGB", raw.size, (255, 255, 255))
+            rgba = raw.convert("RGBA")
+            bg.paste(rgba, (0, 0), rgba)
+            imgs.append(bg)
+        else:
+            imgs.append(raw.convert("RGB"))
+    out = io.BytesIO()
+    imgs[0].save(
+        out,
+        format="PDF",
+        resolution=resolution,
+        save_all=True,
+        append_images=imgs[1:],
+    )
+    return out.getvalue()
+
 
 def extract_client_name(first_page_text: str) -> str:
     stop_words = (
@@ -248,6 +350,19 @@ def extract_client_name(first_page_text: str) -> str:
             continue
         if name_re.fullmatch(line):
             return line
+    return ""
+
+
+def extract_client_passport(first_page_text: str) -> str:
+    """Извлекает серию и номер паспорта из шапки PDF-выписки Т-Банка."""
+    header = re.split(
+        r"движение\s+средств", first_page_text, maxsplit=1, flags=re.IGNORECASE
+    )[0]
+    ser_m = re.search(r"серия\s*:\s*(\d{2}\s?\d{2})\b", header, re.IGNORECASE)
+    num_m = re.search(r"номер\s*:\s*(\d{6})\b", header, re.IGNORECASE)
+    if ser_m and num_m:
+        ser = re.sub(r"\s+", "", ser_m.group(1))
+        return f"{ser} {num_m.group(1)}"
     return ""
 
 
@@ -337,7 +452,7 @@ def detect_method(desc: str, counterparty_key: str | None) -> str:
 
 def parse_tbank_pdf(
     pdf_bytes: bytes, excluded_contracts: set[str]
-) -> tuple[list[dict], int, int, str]:
+) -> tuple[list[dict], int, int, str, str]:
     skip_prefixes = (
         "АКЦИОНЕРНОЕ ОБЩЕСТВО",
         "РОССИЯ,",
@@ -359,12 +474,14 @@ def parse_tbank_pdf(
 
     raw_lines: list[str] = []
     client_name = ""
+    client_passport = ""
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page_idx, page in enumerate(pdf.pages):
             text = page.extract_text() or ""
             if page_idx == 0:
                 client_name = extract_client_name(text)
+                client_passport = extract_client_passport(text)
             for line in text.splitlines():
                 clean_line = line.strip()
                 if not clean_line:
@@ -517,7 +634,7 @@ def parse_tbank_pdf(
             continue
         results.append(item)
 
-    return results, total_recognized, skipped_repeated, client_name
+    return results, total_recognized, skipped_repeated, client_name, client_passport
 
 
 def parse_profile_input(text: str) -> dict[str, str]:
@@ -603,6 +720,37 @@ def build_excel(rows: list[dict]) -> bytes:
     output = io.BytesIO()
     wb.save(output)
     return output.getvalue()
+
+
+def build_transfers_caption(
+    transfers: list[dict],
+    total_recognized: int | None = None,
+    skipped_repeated: int | None = None,
+) -> str:
+    incoming = [t for t in transfers if t["amount"] > 0]
+    outgoing = [t for t in transfers if t["amount"] < 0]
+    total_in = sum(t["amount"] for t in incoming)
+    total_out = sum(t["amount"] for t in outgoing)
+    balance = total_in + total_out
+
+    method_counts = Counter(t["method"] for t in transfers)
+    methods_line = ", ".join(
+        f"{name} — {cnt}" for name, cnt in method_counts.most_common()
+    )
+
+    lines: list[str] = []
+    if total_recognized is not None and skipped_repeated is not None:
+        lines.append(f"Распознано переводов (всего): {total_recognized}")
+        lines.append(f"Отсечено повторяющихся: {skipped_repeated}")
+    else:
+        lines.append("Обновлённый список операций")
+
+    lines.append(f"В таблице: {len(transfers)} ({methods_line})")
+    lines.append("")
+    lines.append(f"Входящие (→ Выводы): {len(incoming)} шт. (+{total_in:,.2f} ₽)")
+    lines.append(f"Исходящие (→ Депозиты): {len(outgoing)} шт. ({total_out:,.2f} ₽)")
+    lines.append(f"Разница: {balance:+,.2f} ₽")
+    return "\n".join(lines).replace(",", " ")
 
 
 # ---------------- ПОИСК РЕСУРСОВ И ОБЩИЕ ХЕЛПЕРЫ PNG ----------------
@@ -919,6 +1067,19 @@ def draw_ios_battery(img: Image.Image, left_x: int, bottom_y: int, battery: int)
     img.paste(small, (left_x, bottom_y - bat_h - 3), small)
 
 
+def draw_home_indicator(draw: ImageDraw.ImageDraw, W: int, H: int) -> None:
+    """Нижняя полоса Home Indicator в стиле iPhone."""
+    bar_w = 420
+    bar_h = 15
+    x0 = (W - bar_w) // 2
+    y0 = H - 38
+    draw.rounded_rectangle(
+        [x0, y0, x0 + bar_w, y0 + bar_h],
+        radius=bar_h // 2,
+        fill=(22, 24, 28),
+    )
+
+
 def draw_status_bar(img: Image.Image, draw: ImageDraw.ImageDraw, W: int, time_str: str, battery: int) -> None:
     font_time = load_font(45, bold=True)
     tb = draw.textbbox((0, 0), time_str, font=font_time)
@@ -1020,11 +1181,17 @@ def draw_chevron_right(img: Image.Image, right_x: int, center_y: int) -> None:
     img.paste(small, (right_x - w, int(center_y - h / 2)), small)
 
 
-def get_status_time_str(ui_settings: dict) -> str:
+def get_status_time_str(ui_settings: dict, minute_offset: int = 0) -> str:
     status_time = ui_settings.get("status_time", "auto")
     if status_time == "auto":
-        return now_msk().strftime("%H:%M")
-    return status_time
+        dt = now_msk() + timedelta(minutes=minute_offset)
+        return dt.strftime("%H:%M")
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", str(status_time).strip())
+    if m:
+        hh, mm = int(m.group(1)), int(m.group(2))
+        total_min = (hh * 60 + mm + minute_offset) % (24 * 60)
+        return f"{total_min // 60:02d}:{total_min % 60:02d}"
+    return str(status_time)
 
 
 def draw_sheet_header(
@@ -1034,10 +1201,11 @@ def draw_sheet_header(
     H: int,
     title: str,
     ui_settings: dict,
+    minute_offset: int = 0,
 ) -> int:
     domain = ui_settings.get("domain", "1wujym.life")
     battery = int(ui_settings.get("battery", 76))
-    status_time = get_status_time_str(ui_settings)
+    status_time = get_status_time_str(ui_settings, minute_offset=minute_offset)
 
     draw_status_bar(img, draw, W, status_time, battery)
     draw_browser_bar(draw, W, domain)
@@ -1094,12 +1262,21 @@ def build_screenshots(
 
     pages: list[bytes] = []
 
-    for start_idx in range(0, len(filtered), per_page):
+    for page_idx, start_idx in enumerate(range(0, len(filtered), per_page)):
         chunk = filtered[start_idx : start_idx + per_page]
 
         img = Image.new("RGB", (W, H), (14, 16, 20))
         draw = ImageDraw.Draw(img)
-        sheet_top = draw_sheet_header(img, draw, W, H, "История платежей", ui_settings)
+        # Автосмещение времени на +1 мин на каждый следующий скрин в серии
+        sheet_top = draw_sheet_header(
+            img,
+            draw,
+            W,
+            H,
+            "История платежей",
+            ui_settings,
+            minute_offset=page_idx,
+        )
 
         tab_y0, tab_y1 = sheet_top + 308, sheet_top + 436
         tab_x0, tab_x1 = 54, W - 54
@@ -1125,8 +1302,8 @@ def build_screenshots(
                 font=font_tab,
             )
 
-        list_top = tab_y1 + 38
-        row_h = 252
+        list_top = tab_y1 + 32
+        row_h = 244
 
         for i, row in enumerate(chunk):
             ry = list_top + i * row_h
@@ -1136,7 +1313,7 @@ def build_screenshots(
 
             icon = card_icon if is_card else sbp_icon
             ix = 44 + (142 - icon.width) // 2
-            iy = ry + 48 + (92 - icon.height) // 2
+            iy = ry + 46 + (92 - icon.height) // 2
             img.paste(icon, (ix, iy), icon)
 
             if is_deposit:
@@ -1155,28 +1332,30 @@ def build_screenshots(
                 amount_str = format_rub(abs(row["amount"]), "-")
 
             tx = 206
-            draw.text((tx, ry + 18), title_lines[0], fill=(17, 24, 39), font=font_row_title)
-            draw.text((tx, ry + 78), title_lines[1], fill=(17, 24, 39), font=font_row_title)
+            draw.text((tx, ry + 16), title_lines[0], fill=(17, 24, 39), font=font_row_title)
+            draw.text((tx, ry + 75), title_lines[1], fill=(17, 24, 39), font=font_row_title)
 
-            draw_checkmark(draw, tx + 2, ry + 148)
-            draw.text((tx + 46, ry + 143), "Выполнено", fill=(46, 158, 91), font=font_status)
+            draw_checkmark(draw, tx + 2, ry + 144)
+            draw.text((tx + 46, ry + 139), "Выполнено", fill=(46, 158, 91), font=font_status)
 
             right_x = W - 52
 
             ab = draw.textbbox((0, 0), amount_str, font=font_amount)
-            draw.text((right_x - (ab[2] - ab[0]), ry + 20), amount_str, fill=(17, 24, 39), font=font_amount)
+            draw.text((right_x - (ab[2] - ab[0]), ry + 18), amount_str, fill=(17, 24, 39), font=font_amount)
 
             date_str = row["date"]
             db = draw.textbbox((0, 0), date_str, font=font_meta)
-            draw.text((right_x - (db[2] - db[0]), ry + 92), date_str, fill=(142, 149, 160), font=font_meta)
+            draw.text((right_x - (db[2] - db[0]), ry + 90), date_str, fill=(142, 149, 160), font=font_meta)
 
             time_str = make_seconds(row)
             tb_t = draw.textbbox((0, 0), time_str, font=font_meta)
-            draw.text((right_x - (tb_t[2] - tb_t[0]), ry + 146), time_str, fill=(142, 149, 160), font=font_meta)
+            draw.text((right_x - (tb_t[2] - tb_t[0]), ry + 142), time_str, fill=(142, 149, 160), font=font_meta)
 
             if i < len(chunk) - 1:
-                sep_y = ry + row_h - 16
+                sep_y = ry + row_h - 14
                 draw.line([(tx, sep_y), (right_x, sep_y)], fill=(242, 244, 247), width=2)
+
+        draw_home_indicator(draw, W, H)
 
         buf = io.BytesIO()
         img.save(buf, format="PNG")
@@ -1345,12 +1524,14 @@ def build_profile_screenshot(profile: dict, ui_settings: dict) -> bytes:
         font=font_helper,
     )
 
+    draw_home_indicator(draw, W, H)
+
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
 
-# ---------------- ГЕНЕРАЦИЯ БЛАНКА КНД 1175018 (A4 PNG) ----------------
+# ---------------- ГЕНЕРАЦИЯ БЛАНКА КНД 1175018 (A4 PNG/PDF) ----------------
 
 def fmt_money_blank(val: float | str) -> str:
     if isinstance(val, str):
@@ -1901,14 +2082,6 @@ def build_ep_stamp_image(
     target_width: int,
     blank_meta: dict | None = None,
 ) -> Image.Image:
-    """
-    Рисует штамп ЭП на чисто белом фоне с тонкой чёрной рамкой:
-      ДОКУМЕНТ ПОДПИСАН ЭЛЕКТРОННОЙ ПОДПИСЬЮ
-      Владелец:  ...
-      Сертификат: ...
-      УЦ:  ...
-      Действителен:  с ДД.ММ.ГГГГ по ДД.ММ.ГГГГ,  подписан: ДД.ММ.ГГГГ
-    """
     scale = 2
     ref_w = 1140
     ref_h = 204
@@ -1964,7 +2137,6 @@ def apply_ep_stamp_to_image(
     ep: dict,
     blank_meta: dict | None = None,
 ) -> bytes:
-    """Накладывает штамп ЭП в нижней части бланка (по умолчанию по центру)."""
     raw = Image.open(io.BytesIO(img_bytes))
     if raw.mode in ("RGBA", "LA") or (raw.mode == "P" and "transparency" in raw.info):
         base = Image.new("RGB", raw.size, (255, 255, 255))
@@ -2016,6 +2188,188 @@ def normalize_uploaded_image(raw_bytes: bytes) -> bytes:
     return out.getvalue()
 
 
+# ---------------- ПРАВКА СПИСКА ОПЕРАЦИЙ ----------------
+
+def transfer_sort_key(row: dict) -> tuple[int, int, int, int, int]:
+    try:
+        d, m, y = row.get("date", "01.01.2000").split(".")
+        t_parts = (row.get("time") or "00:00").split(":")
+        hh = int(t_parts[0])
+        mm = int(t_parts[1]) if len(t_parts) > 1 else 0
+        return (int(y), int(m), int(d), hh, mm)
+    except Exception:
+        return (0, 0, 0, 0, 0)
+
+
+def parse_date_obj(s: str) -> datetime | None:
+    try:
+        return datetime.strptime(s.strip(), "%d.%m.%Y")
+    except Exception:
+        return None
+
+
+def build_edit_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    transfers = LAST_TRANSFERS.get(user_id, [])
+    if not transfers:
+        return (
+            "Список операций пуст. Отправь PDF-выписку или нажми «Сбросить правки».",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="Сбросить правки", callback_data="edit:reset")]
+                ]
+            ),
+        )
+
+    lines = [f"<b>Редактирование списка ({len(transfers)} шт.):</b>\n"]
+    max_show = 45
+    for idx, t in enumerate(transfers[:max_show], start=1):
+        role = "Вывод" if t["amount"] > 0 else "Деп"
+        amt = f"{abs(t['amount']):,.0f}".replace(",", " ")
+        lines.append(
+            f"{idx}. <code>{t['date']} {t['time']}</code> | {role} ({t['method']}) | <b>{amt} ₽</b>"
+        )
+    if len(transfers) > max_show:
+        lines.append(f"<i>... и ещё {len(transfers) - max_show} шт.</i>")
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Удалить строки", callback_data="edit:del"),
+                InlineKeyboardButton(text="+ Добавить", callback_data="edit:add"),
+            ],
+            [
+                InlineKeyboardButton(text="Фильтр (дата / сумма)", callback_data="edit:filter"),
+                InlineKeyboardButton(text="Сбросить правки", callback_data="edit:reset"),
+            ],
+            [
+                InlineKeyboardButton(text="Готово — обновить Excel и кнопки", callback_data="edit:done"),
+            ],
+        ]
+    )
+    return "\n".join(lines), kb
+
+
+def apply_edit_delete(transfers: list[dict], text: str) -> tuple[list[dict], int]:
+    to_remove: set[int] = set()
+    for token in re.split(r"[\s,;]+", text.strip()):
+        if not token:
+            continue
+        rm = re.fullmatch(r"(\d+)\s*[-–]\s*(\d+)", token)
+        if rm:
+            a, b = int(rm.group(1)), int(rm.group(2))
+            for i in range(min(a, b), max(a, b) + 1):
+                if 1 <= i <= len(transfers):
+                    to_remove.add(i)
+        elif token.isdigit():
+            i = int(token)
+            if 1 <= i <= len(transfers):
+                to_remove.add(i)
+    new_list = [t for idx, t in enumerate(transfers, start=1) if idx not in to_remove]
+    return new_list, len(to_remove)
+
+
+def apply_edit_add(text: str) -> dict | None:
+    """
+    Форматы:
+      деп 7000 25.11.2026 18:10 сбп
+      выв 5000 26.11.2026 14:30 карта
+      -7000 25.11.2026 18:10 сбп
+      +5000 26.11.2026 14:30 карта
+    """
+    raw = text.strip()
+    low = raw.lower()
+
+    date_m = re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", raw)
+    time_m = re.search(r"\b\d{1,2}:\d{2}\b", raw)
+
+    rem = raw
+    date_str = date_m.group(0) if date_m else now_msk().strftime("%d.%m.%Y")
+    if date_m:
+        rem = rem[: date_m.start()] + " " + rem[date_m.end() :]
+
+    if time_m:
+        hh, mm = time_m.group(0).split(":")
+        time_str = f"{int(hh):02d}:{int(mm):02d}"
+        rem = re.sub(r"\b\d{1,2}:\d{2}\b", " ", rem, count=1)
+    else:
+        time_str = now_msk().strftime("%H:%M")
+
+    method = "По карте" if ("карт" in low or "card" in low) else "СБП"
+
+    amt_m = re.search(r"([+-]?\s*\d[\d\s]*[.,]?\d*)", rem)
+    if not amt_m:
+        return None
+    try:
+        raw_num = amt_m.group(1).replace(" ", "").replace(",", ".")
+        val = float(raw_num)
+    except ValueError:
+        return None
+    if val == 0:
+        return None
+
+    if any(k in low for k in ("деп", "пополн", "исход")):
+        amount = -abs(val)
+    elif any(k in low for k in ("выв", "вход")):
+        amount = abs(val)
+    else:
+        amount = val
+
+    direction = "Входящий" if amount > 0 else "Исходящий"
+    return {
+        "date": date_str,
+        "time": time_str,
+        "direction": direction,
+        "method": method,
+        "amount": amount,
+        "counterparty_key": None,
+        "counterparty": "",
+        "description": "Добавлено вручную",
+        "card": "",
+    }
+
+
+def apply_edit_filter(transfers: list[dict], text: str) -> tuple[list[dict], str] | None:
+    low = text.lower()
+    dates = re.findall(r"\b\d{2}\.\d{2}\.\d{4}\b", text)
+    min_m = re.search(r"от\s+(\d[\d\s.,]*)", low)
+    max_m = re.search(r"до\s+(\d[\d\s.,]*)", low)
+
+    if not dates and not min_m and not max_m:
+        return None
+
+    d_from = parse_date_obj(dates[0]) if len(dates) >= 1 else None
+    d_to = parse_date_obj(dates[1]) if len(dates) >= 2 else d_from
+    if d_from and d_to and d_from > d_to:
+        d_from, d_to = d_to, d_from
+
+    min_amt = parse_float_val(min_m.group(1)) if min_m else None
+    max_amt = parse_float_val(max_m.group(1)) if max_m else None
+
+    result: list[dict] = []
+    for t in transfers:
+        a = abs(t["amount"])
+        if min_amt is not None and a < min_amt:
+            continue
+        if max_amt is not None and a > max_amt:
+            continue
+        if d_from and d_to:
+            td = parse_date_obj(t.get("date", ""))
+            if not td or not (d_from <= td <= d_to):
+                continue
+        result.append(t)
+
+    parts = []
+    if d_from and d_to:
+        parts.append(
+            f"даты {d_from.strftime('%d.%m.%Y')}–{d_to.strftime('%d.%m.%Y')}"
+        )
+    if min_amt is not None:
+        parts.append(f"от {min_amt:,.0f} ₽".replace(",", " "))
+    if max_amt is not None:
+        parts.append(f"до {max_amt:,.0f} ₽".replace(",", " "))
+    return result, ", ".join(parts)
+
+
 # ---------------- КЛАВИАТУРЫ И ТЕКСТЫ ----------------
 
 def build_start_keyboard() -> InlineKeyboardMarkup:
@@ -2026,7 +2380,8 @@ def build_start_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Скриншот профиля", callback_data="scr:profile"),
             ],
             [
-                InlineKeyboardButton(text="Настройка ЭП (подпись)", callback_data="ep:menu"),
+                InlineKeyboardButton(text="Настройка ЭП", callback_data="ep:menu"),
+                InlineKeyboardButton(text="Шаблоны компаний", callback_data="agt:menu"),
             ],
         ]
     )
@@ -2058,7 +2413,10 @@ def build_action_keyboard(transfers: list[dict]) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text=f"Скрины: Все ({all_cnt})", callback_data="scr:all"
-                )
+                ),
+                InlineKeyboardButton(
+                    text="Править список", callback_data="edit:menu"
+                ),
             ]
         )
     buttons.append(
@@ -2070,21 +2428,61 @@ def build_action_keyboard(transfers: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def build_blank_ready_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Подписать (ЭП)", callback_data="ep:menu"),
-                InlineKeyboardButton(text="Новый бланк", callback_data="scr:blank"),
-            ]
+def build_blank_ready_keyboard(has_agent: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="Подписать (ЭП)", callback_data="ep:menu"),
+            InlineKeyboardButton(text="Скачать PNG", callback_data="blk:get_png"),
         ]
-    )
+    ]
+    row2 = []
+    if has_agent:
+        row2.append(InlineKeyboardButton(text="Сохранить компанию", callback_data="agt:save_last"))
+    row2.append(InlineKeyboardButton(text="Новый бланк", callback_data="scr:blank"))
+    rows.append(row2)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_agents_menu() -> tuple[str, InlineKeyboardMarkup]:
+    agents = load_agents()
+    rows: list[list[InlineKeyboardButton]] = []
+    if not agents:
+        text = (
+            "<b>Шаблоны налоговых агентов (компаний)</b>\n\n"
+            "Пока пусто. Ты можешь добавить компанию сейчас или нажать "
+            "<b>«Сохранить компанию»</b> после заполнения любого бланка."
+        )
+    else:
+        lines = ["<b>Сохранённые компании (нажми, чтобы применить к ЭП или удалить):</b>\n"]
+        for idx, a in enumerate(agents, start=1):
+            inn = a.get("agent_inn") or "—"
+            kpp = a.get("agent_kpp") or "—"
+            lines.append(
+                f"{idx}. <b>{html.escape(a.get('agent_name', ''))}</b> (ИНН {html.escape(inn)} / КПП {html.escape(kpp)})"
+            )
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"ЭП: {a.get('agent_name', '')[:22]}",
+                        callback_data=f"agt:use_ep:{a['id']}",
+                    ),
+                    InlineKeyboardButton(
+                        text="Удалить",
+                        callback_data=f"agt:del:{a['id']}",
+                    ),
+                ]
+            )
+        text = "\n".join(lines)
+
+    rows.append([InlineKeyboardButton(text="+ Добавить компанию", callback_data="agt:add")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_ep_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     ep = load_ep_settings()
     meta = LAST_BLANK_META.get(user_id)
-    has_blank = user_id in LAST_BLANK_IMAGE
+    pages = LAST_BLANK_PAGES.get(user_id)
+    has_blank = bool(pages)
     pos_cur = ep.get("position", "center")
     pos_labels = {"left": "Снизу слева", "center": "Снизу по центру", "right": "Снизу справа"}
     signed_preview = resolve_signed_date(ep, meta)
@@ -2102,7 +2500,8 @@ def build_ep_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
     rows: list[list[InlineKeyboardButton]] = []
     if has_blank:
-        text += "\nБланк загружен — можно подписать сразу или сначала изменить реквизиты ЭП."
+        p_cnt = len(pages or [])
+        text += f"\nБланк загружен ({p_cnt} стр.) — можно подписать сразу или изменить реквизиты ЭП."
         rows.append([InlineKeyboardButton(text="Подписать текущими данными", callback_data="ep:apply")])
         if meta and meta.get("agent_name"):
             short_agent = meta["agent_name"][:28]
@@ -2115,7 +2514,7 @@ def build_ep_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
                 ]
             )
     else:
-        text += "\nОтправь боту бланк картинкой (фото или PNG/JPG) либо заполни новый через /blank."
+        text += "\nОтправь боту бланк (PDF, фото или PNG/JPG) либо заполни новый через /blank."
 
     rows.append(
         [
@@ -2214,10 +2613,7 @@ def get_ep_step_prompt(step_idx: int, user_id: int) -> tuple[str, InlineKeyboard
         rows.append([InlineKeyboardButton(text="Оставить текущие", callback_data="epw:keep")])
 
     else:  # position
-        text = (
-            header
-            + "<b>Где разместить штамп ЭП внизу бланка?</b>"
-        )
+        text = header + "<b>Где разместить штамп ЭП внизу бланка?</b>"
         rows.append(
             [
                 InlineKeyboardButton(text="Слева", callback_data="epw:pos_left"),
@@ -2231,34 +2627,39 @@ def get_ep_step_prompt(step_idx: int, user_id: int) -> tuple[str, InlineKeyboard
 
 
 async def send_signed_blank(message: types.Message, user_id: int, ep_override: dict | None = None) -> None:
-    img_bytes = LAST_BLANK_IMAGE.get(user_id)
-    if not img_bytes:
+    pages = LAST_BLANK_PAGES.get(user_id)
+    if not pages:
         await message.answer(
-            "Настройки ЭП сохранены. Теперь отправь бланк картинкой (фото или PNG/JPG) "
+            "Настройки ЭП сохранены. Теперь отправь бланк (PDF, фото или PNG/JPG) "
             "или заполни новый через /blank — и нажми «Подписать»."
         )
         return
 
     ep = ep_override if ep_override is not None else load_ep_settings()
     meta = LAST_BLANK_META.get(user_id)
-    wait_msg = await message.answer("Накладываю электронную подпись...")
+    wait_msg = await message.answer("Накладываю электронную подпись и собираю PDF...")
     try:
-        signed_png = apply_ep_stamp_to_image(img_bytes, ep, blank_meta=meta)
+        signed_last_png = apply_ep_stamp_to_image(pages[-1], ep, blank_meta=meta)
+        LAST_SIGNED_PNG[user_id] = signed_last_png
+        signed_pages = pages[:-1] + [signed_last_png]
+        signed_pdf = images_to_pdf_bytes(signed_pages, resolution=200.0)
+
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="Изменить ЭП и переподписать", callback_data="ep:menu"),
+                    InlineKeyboardButton(text="Скачать PNG", callback_data="ep:get_png"),
+                    InlineKeyboardButton(text="Изменить ЭП", callback_data="ep:menu"),
                 ]
             ]
         )
         await message.answer_photo(
-            BufferedInputFile(signed_png, filename="signed_blank.png"),
-            caption="Подписанный бланк готов (ниже файл без сжатия).",
+            BufferedInputFile(signed_last_png, filename="signed_blank.png"),
+            caption="Подписанный бланк готов (ниже готовый PDF-документ).",
             reply_markup=kb,
         )
         await message.answer_document(
-            BufferedInputFile(signed_png, filename="signed_blank.png"),
-            caption="Можно прислать другой бланк картинкой или нажать /blank.",
+            BufferedInputFile(signed_pdf, filename="signed_blank.pdf"),
+            caption="Подписанный PDF. Можно прислать другой бланк (PDF или картинку) либо нажать /blank.",
         )
         await wait_msg.delete()
     except Exception as e:
@@ -2536,11 +2937,23 @@ def get_blank_step_prompt(step_idx: int, data: dict) -> tuple[str, InlineKeyboar
         rows.append([InlineKeyboardButton(text=f"По умолчанию ({cur_year}, {today_str})", callback_data="blk:default")])
 
     elif step == "agent_name":
+        agents = load_agents()
         text = (
             header
             + "<b>Налоговый агент</b> (название организации / ИП).\n"
             + 'Например: <code>ООО «Ромашка»</code>'
         )
+        if agents:
+            text += "\n\nИли выбери сохранённый шаблон (реквизиты ОКТМО/ИНН/КПП подставятся сами):"
+            for a in agents[:6]:
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            text=f"Шаблон: {a.get('agent_name', '')[:30]}",
+                            callback_data=f"blk:tpl:{a['id']}",
+                        )
+                    ]
+                )
         rows.append([InlineKeyboardButton(text="Пропустить", callback_data="blk:skip")])
 
     elif step == "agent_details":
@@ -2585,12 +2998,16 @@ def get_blank_step_prompt(step_idx: int, data: dict) -> tuple[str, InlineKeyboar
             rows.append([InlineKeyboardButton(text="Только 1 и 643 (без даты)", callback_data="blk:default")])
 
     elif step == "passport":
+        saved_pass = profile.get("passport", "").strip()
         text = (
             header
             + "<b>Код документа и серия/номер паспорта.</b>\n"
             + "Например: <code>21 2022 720045</code>\n"
             + "(Можно ввести просто <code>2022 720045</code> — код <code>21</code> подставится сам.)"
         )
+        if saved_pass:
+            text += f"\n\nИз последней выписки: <code>21 {html.escape(saved_pass)}</code>"
+            rows.append([InlineKeyboardButton(text=f"Подставить: 21 {saved_pass}", callback_data="blk:default")])
         rows.append([InlineKeyboardButton(text="Пропустить", callback_data="blk:skip")])
 
     elif step == "tax_rate":
@@ -2628,7 +3045,7 @@ def get_blank_step_prompt(step_idx: int, data: dict) -> tuple[str, InlineKeyboar
         text = (
             header
             + "<b>Раздел 5 (общие суммы дохода и налога).</b>\n"
-            + f"Авторасчёт по разделу 3:\n"
+            + "Авторасчёт по разделу 3:\n"
             + f"• Общая сумма дохода: <code>{auto_t['total_income']}</code>\n"
             + f"• Налоговая база: <code>{auto_t['tax_base']}</code>\n"
             + f"• Налог исчисленный / удержанный: <code>{auto_t['tax_calc']}</code>\n\n"
@@ -2651,22 +3068,29 @@ async def send_blank_step_or_finish(message: types.Message, user_id: int) -> Non
 
     if step_idx >= len(BLANK_STEPS):
         BLANK_SESSIONS.pop(user_id, None)
-        wait_msg = await message.answer("Формирую бланк КНД 1175018...")
+        wait_msg = await message.answer("Формирую бланк КНД 1175018 (PNG + A4 PDF)...")
         try:
             png_bytes = build_knd_1175018_png(data)
-            LAST_BLANK_IMAGE[user_id] = png_bytes
+            pdf_bytes = images_to_pdf_bytes([png_bytes], resolution=200.0)
+            LAST_BLANK_PAGES[user_id] = [png_bytes]
             LAST_BLANK_META[user_id] = {
                 "agent_name": (data.get("agent_name") or "").strip(),
+                "oktmo": (data.get("oktmo") or "").strip(),
+                "agent_phone": (data.get("agent_phone") or "").strip(),
+                "agent_inn": (data.get("agent_inn") or "").strip(),
+                "agent_kpp": (data.get("agent_kpp") or "").strip(),
                 "issue_date": (data.get("issue_date") or "").strip(),
+                "tpl_ep": data.get("_tpl_ep"),
             }
+            has_agent = bool(LAST_BLANK_META[user_id]["agent_name"])
             await message.answer_photo(
                 BufferedInputFile(png_bytes, filename="knd_1175018.png"),
-                caption="Готовый бланк КНД 1175018 (ниже файл без сжатия). Можешь сразу нажать «Подписать (ЭП)».",
-                reply_markup=build_blank_ready_keyboard(),
+                caption="Готовый бланк КНД 1175018 (ниже файл A4 PDF). Можешь сразу подписать его ЭП.",
+                reply_markup=build_blank_ready_keyboard(has_agent=has_agent),
             )
             await message.answer_document(
-                BufferedInputFile(png_bytes, filename="knd_1175018.png"),
-                caption="Для подписи нажми «Подписать (ЭП)» выше или /sign.",
+                BufferedInputFile(pdf_bytes, filename="knd_1175018.pdf"),
+                caption="Бланк в формате PDF. Для подписи нажми «Подписать (ЭП)» выше или /sign.",
             )
             await wait_msg.delete()
         except Exception as e:
@@ -2695,6 +3119,29 @@ def apply_blank_step(session: dict, raw_text: str | None, action: str = "text") 
         elif step == "totals":
             data["totals"] = compute_auto_totals(data)
         session["step_idx"] += 1
+        return None
+
+    if step == "agent_name" and action.startswith("tpl:"):
+        tpl_id = action.split(":", 1)[1]
+        agents = load_agents()
+        tpl = next((a for a in agents if a.get("id") == tpl_id), None)
+        if not tpl:
+            return "Шаблон не найден, введи название компании вручную."
+        data["agent_name"] = tpl.get("agent_name", "")
+        data["oktmo"] = tpl.get("oktmo", "")
+        data["agent_phone"] = tpl.get("agent_phone", "")
+        data["agent_inn"] = tpl.get("agent_inn", "")
+        data["agent_kpp"] = tpl.get("agent_kpp", "")
+        if tpl.get("ep_owner"):
+            data["_tpl_ep"] = {
+                "owner": tpl.get("ep_owner", ""),
+                "cert": tpl.get("ep_cert", ""),
+                "ca": tpl.get("ep_ca", "Федеральная налоговая служба"),
+                "valid_from": tpl.get("ep_valid_from", ""),
+                "valid_to": tpl.get("ep_valid_to", ""),
+            }
+        # Пропускаем и agent_name, и agent_details
+        session["step_idx"] += 2
         return None
 
     if step == "year_date":
@@ -2757,13 +3204,19 @@ def apply_blank_step(session: dict, raw_text: str | None, action: str = "text") 
             data["country_code"] = country
 
     elif step == "passport":
-        m_code = re.match(r"^(\d{2})\s+(.+)$", text)
-        if m_code:
-            data["doc_code"] = m_code.group(1)
-            data["doc_number"] = m_code.group(2).strip()
+        if action == "default":
+            saved_pass = profile.get("passport", "").strip()
+            if saved_pass:
+                data["doc_code"] = "21"
+                data["doc_number"] = saved_pass
         else:
-            data["doc_code"] = "21"
-            data["doc_number"] = text
+            m_code = re.match(r"^(\d{2})\s+(.+)$", text)
+            if m_code:
+                data["doc_code"] = m_code.group(1)
+                data["doc_number"] = m_code.group(2).strip()
+            else:
+                data["doc_code"] = "21"
+                data["doc_number"] = text
 
     elif step == "tax_rate":
         if action == "default":
@@ -2833,14 +3286,16 @@ async def cmd_start(message: types.Message):
         f"{html.escape(f_bold.name) if f_bold else 'системный'}"
     )
     await message.answer(
-        "• Кидай <b>PDF-выписку из Т-Банка</b> — верну Excel и кнопки для PNG-скриншотов.\n"
-        "• Кидай <b>картинку бланка (фото или PNG/JPG)</b> — предложу подписать её настраиваемой ЭП.\n\n"
+        "• Кидай <b>PDF-выписку из Т-Банка</b> — верну Excel, правку списка и PNG-скриншоты.\n"
+        "• Кидай <b>готовый бланк (PDF, фото или PNG/JPG)</b> — предложу подписать его настраиваемой ЭП.\n\n"
         f"Настройки скрина: домен <code>{html.escape(ui['domain'])}</code>, "
         f"часы <code>{html.escape(str(ui['status_time']))}</code>, заряд <code>{ui['battery']}%</code>\n"
         f"{assets_info}\n\n"
         "Команды:\n"
-        "/blank — заполнить бланк справки о доходах (КНД 1175018)\n"
-        "/sign — настроить ЭП и подписать последний бланк\n"
+        "/blank — заполнить бланк справки о доходах (PDF + PNG)\n"
+        "/sign — настроить ЭП и подписать бланк\n"
+        "/agents — шаблоны налоговых агентов (компаний)\n"
+        "/edit — править список операций из последней выписки\n"
         "/profile — сделать скриншот профиля (Настройки)\n"
         "/domain 1wujym.life — сменить домен в строке браузера\n"
         "/status 22:21 76 — задать часы и уровень батареи (или /status auto 65)\n"
@@ -2869,6 +3324,28 @@ async def cmd_sign(message: types.Message):
     user_id = message.from_user.id
     clear_active_inputs(user_id)
     text, kb = build_ep_menu(user_id)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.message(Command("agents"))
+async def cmd_agents(message: types.Message):
+    if not is_allowed_user(message.from_user) or not message.from_user:
+        return
+    clear_active_inputs(message.from_user.id)
+    text, kb = build_agents_menu()
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.message(Command("edit"))
+async def cmd_edit(message: types.Message):
+    if not is_allowed_user(message.from_user) or not message.from_user:
+        return
+    user_id = message.from_user.id
+    clear_active_inputs(user_id)
+    if user_id not in LAST_TRANSFERS:
+        await message.answer("Сначала отправь PDF-выписку из Т-Банка.")
+        return
+    text, kb = build_edit_menu(user_id)
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
@@ -2968,7 +3445,6 @@ async def cmd_unexclude(message: types.Message):
 
 @dp.message(F.photo)
 async def handle_uploaded_photo_blank(message: types.Message, bot: Bot):
-    """Принимает фото бланка и предлагает подписать его настраиваемой ЭП."""
     if not is_allowed_user(message.from_user) or not message.from_user or not message.photo:
         return
     user_id = message.from_user.id
@@ -2979,12 +3455,12 @@ async def handle_uploaded_photo_blank(message: types.Message, bot: Bot):
         file_info = await bot.get_file(photo.file_id)
         buf = io.BytesIO()
         await bot.download_file(file_info.file_path, buf)
-        LAST_BLANK_IMAGE[user_id] = normalize_uploaded_image(buf.getvalue())
+        LAST_BLANK_PAGES[user_id] = [normalize_uploaded_image(buf.getvalue())]
         LAST_BLANK_META.pop(user_id, None)
 
         text, kb = build_ep_menu(user_id)
         await message.answer(
-            "Бланк получен! Выбери действие:\n\n" + text,
+            "Бланк (фото) получен! Выбери действие:\n\n" + text,
             reply_markup=kb,
             parse_mode="HTML",
         )
@@ -3010,12 +3486,12 @@ async def handle_document(message: types.Message, bot: Bot):
             file_info = await bot.get_file(doc.file_id)
             buf = io.BytesIO()
             await bot.download_file(file_info.file_path, buf)
-            LAST_BLANK_IMAGE[user_id] = normalize_uploaded_image(buf.getvalue())
+            LAST_BLANK_PAGES[user_id] = [normalize_uploaded_image(buf.getvalue())]
             LAST_BLANK_META.pop(user_id, None)
 
             text, kb = build_ep_menu(user_id)
             await message.answer(
-                "Бланк получен! Выбери действие:\n\n" + text,
+                "Бланк (изображение) получен! Выбери действие:\n\n" + text,
                 reply_markup=kb,
                 parse_mode="HTML",
             )
@@ -3026,11 +3502,11 @@ async def handle_document(message: types.Message, bot: Bot):
 
     if not fname.endswith(".pdf"):
         await message.answer(
-            "Пришли PDF-выписку из Т-Банка для разбора или бланк картинкой (фото / PNG / JPG) для подписи ЭП."
+            "Пришли PDF-выписку из Т-Банка для разбора или бланк (PDF / фото / PNG / JPG) для подписи ЭП."
         )
         return
 
-    wait_msg = await message.answer("Разбираю выписку...")
+    wait_msg = await message.answer("Обрабатываю PDF...")
 
     try:
         file_info = await bot.get_file(doc.file_id)
@@ -3038,14 +3514,36 @@ async def handle_document(message: types.Message, bot: Bot):
         await bot.download_file(file_info.file_path, buf)
         pdf_bytes = buf.getvalue()
 
+        # Если это не выписка Т-Банка — считаем, что прислали PDF-бланк для подписи ЭП
+        if not is_tbank_statement_pdf(pdf_bytes):
+            await wait_msg.edit_text("Готовлю PDF-бланк к подписи...")
+            pages_png = render_pdf_to_png_pages(pdf_bytes, resolution=200)
+            if not pages_png:
+                await wait_msg.edit_text("Не удалось прочитать страницы PDF.")
+                return
+            LAST_BLANK_PAGES[user_id] = pages_png
+            LAST_BLANK_META.pop(user_id, None)
+
+            text, kb = build_ep_menu(user_id)
+            await wait_msg.delete()
+            await message.answer(
+                f"PDF-бланк получен ({len(pages_png)} стр.)! Выбери действие:\n\n" + text,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            return
+
         excluded = load_excluded()
-        transfers, total_recognized, skipped_repeated, client_name = parse_tbank_pdf(
-            pdf_bytes, excluded
+        transfers, total_recognized, skipped_repeated, client_name, client_passport = (
+            parse_tbank_pdf(pdf_bytes, excluded)
         )
 
-        if client_name:
+        if client_name or client_passport:
             profile = load_profile()
-            profile["name"] = client_name
+            if client_name:
+                profile["name"] = client_name
+            if client_passport:
+                profile["passport"] = client_passport
             save_profile(profile)
 
         if not transfers:
@@ -3057,30 +3555,12 @@ async def handle_document(message: types.Message, bot: Bot):
             return
 
         LAST_TRANSFERS[user_id] = transfers
-
-        incoming = [t for t in transfers if t["amount"] > 0]
-        outgoing = [t for t in transfers if t["amount"] < 0]
-
-        total_in = sum(t["amount"] for t in incoming)
-        total_out = sum(t["amount"] for t in outgoing)
-        balance = total_in + total_out
-
-        method_counts = Counter(t["method"] for t in transfers)
-        methods_line = ", ".join(
-            f"{name} — {cnt}" for name, cnt in method_counts.most_common()
-        )
+        LAST_TRANSFERS_ORIG[user_id] = copy.deepcopy(transfers)
+        LAST_PDF_STEM[user_id] = Path(doc.file_name or "statement").stem
 
         excel_bytes = build_excel(transfers)
-        out_name = f"transfers_{Path(doc.file_name).stem}.xlsx"
-
-        caption = (
-            f"Распознано переводов (всего): {total_recognized}\n"
-            f"Отсечено повторяющихся: {skipped_repeated}\n"
-            f"В таблице (разовых): {len(transfers)} ({methods_line})\n\n"
-            f"Входящие (→ Выводы): {len(incoming)} шт. (+{total_in:,.2f} ₽)\n"
-            f"Исходящие (→ Депозиты): {len(outgoing)} шт. ({total_out:,.2f} ₽)\n"
-            f"Разница: {balance:+,.2f} ₽"
-        ).replace(",", " ")
+        out_name = f"transfers_{LAST_PDF_STEM[user_id]}.xlsx"
+        caption = build_transfers_caption(transfers, total_recognized, skipped_repeated)
 
         await message.answer_document(
             BufferedInputFile(excel_bytes, filename=out_name),
@@ -3091,7 +3571,7 @@ async def handle_document(message: types.Message, bot: Bot):
 
     except Exception as e:
         logging.exception("Ошибка при разборе PDF")
-        await wait_msg.edit_text(f"Не удалось разобрать файл: {e}")
+        await wait_msg.edit_text(f"Не удалось обработать PDF: {e}")
 
 
 # ---------------- CALLBACK-ОБРАБОТЧИКИ ----------------
@@ -3123,6 +3603,187 @@ async def handle_blank_button(callback: types.CallbackQuery):
     await send_blank_step_or_finish(callback.message, user_id)
 
 
+@dp.callback_query(F.data.startswith("agt:"))
+async def handle_agents_callback(callback: types.CallbackQuery):
+    if not is_allowed_user(callback.from_user):
+        await callback.answer()
+        return
+
+    user_id = callback.from_user.id
+    parts = callback.data.split(":")
+    action = parts[1]
+
+    if action == "menu":
+        clear_active_inputs(user_id)
+        await callback.answer()
+        text, kb = build_agents_menu()
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+        return
+
+    if action == "add":
+        clear_active_inputs(user_id)
+        WAITING_AGENT_ADD.add(user_id)
+        await callback.answer()
+        await callback.message.answer(
+            "<b>Добавление шаблона компании</b>\n\n"
+            "Пришли в одном сообщении с новой строки:\n"
+            "1-я строка: <b>Название компании</b>\n"
+            "2-я строка (необязательно): <b>ОКТМО Телефон ИНН КПП</b>\n\n"
+            "Пример:\n"
+            "<code>ООО «СИСТЕМА ПБО»\n"
+            "20701000 +74732000000 3662123456 366201001</code>\n\n"
+            "Для отмены нажми /cancel",
+            parse_mode="HTML",
+        )
+        return
+
+    if action == "save_last":
+        meta = LAST_BLANK_META.get(user_id)
+        if not meta or not meta.get("agent_name"):
+            await callback.answer("Нет данных компании из последнего бланка.", show_alert=True)
+            return
+        ep = load_ep_settings()
+        tpl = upsert_agent_template(
+            {
+                "agent_name": meta.get("agent_name", ""),
+                "oktmo": meta.get("oktmo", ""),
+                "agent_phone": meta.get("agent_phone", ""),
+                "agent_inn": meta.get("agent_inn", ""),
+                "agent_kpp": meta.get("agent_kpp", ""),
+                "ep_owner": ep.get("owner") if ep.get("owner") else meta.get("agent_name", ""),
+                "ep_cert": ep.get("cert", ""),
+                "ep_ca": ep.get("ca", "Федеральная налоговая служба"),
+                "ep_valid_from": ep.get("valid_from", ""),
+                "ep_valid_to": ep.get("valid_to", ""),
+            }
+        )
+        await callback.answer(f"Сохранено: {tpl['agent_name'][:25]}", show_alert=True)
+        return
+
+    if action == "del" and len(parts) >= 3:
+        tpl_id = parts[2]
+        agents = [a for a in load_agents() if a.get("id") != tpl_id]
+        save_agents(agents)
+        await callback.answer("Шаблон удалён")
+        text, kb = build_agents_menu()
+        try:
+            await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+        return
+
+    if action == "use_ep" and len(parts) >= 3:
+        tpl_id = parts[2]
+        tpl = next((a for a in load_agents() if a.get("id") == tpl_id), None)
+        if not tpl:
+            await callback.answer("Шаблон не найден", show_alert=True)
+            return
+        ep = load_ep_settings()
+        ep["owner"] = tpl.get("ep_owner") or tpl.get("agent_name") or ep["owner"]
+        if tpl.get("ep_cert"):
+            ep["cert"] = tpl["ep_cert"]
+        if tpl.get("ep_ca"):
+            ep["ca"] = tpl["ep_ca"]
+        if tpl.get("ep_valid_from"):
+            ep["valid_from"] = tpl["ep_valid_from"]
+        if tpl.get("ep_valid_to"):
+            ep["valid_to"] = tpl["ep_valid_to"]
+        save_ep_settings(ep)
+        await callback.answer("Реквизиты ЭП обновлены из шаблона")
+        text, kb = build_ep_menu(user_id)
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+        return
+
+
+@dp.callback_query(F.data.startswith("edit:"))
+async def handle_edit_callback(callback: types.CallbackQuery):
+    if not is_allowed_user(callback.from_user):
+        await callback.answer()
+        return
+
+    user_id = callback.from_user.id
+    action = callback.data.split(":", 1)[1]
+
+    if user_id not in LAST_TRANSFERS and action != "reset":
+        await callback.answer("Сначала отправь PDF-выписку из Т-Банка.", show_alert=True)
+        return
+
+    if action == "menu":
+        clear_active_inputs(user_id)
+        await callback.answer()
+        text, kb = build_edit_menu(user_id)
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+        return
+
+    if action == "del":
+        clear_active_inputs(user_id)
+        EDIT_MODE[user_id] = "del"
+        await callback.answer()
+        await callback.message.answer(
+            "Введи <b>номера строк</b> для удаления через пробел или диапазоном.\n"
+            "Например: <code>1 4 7</code> или <code>2-5</code>\n\nДля отмены: /cancel",
+            parse_mode="HTML",
+        )
+        return
+
+    if action == "add":
+        clear_active_inputs(user_id)
+        EDIT_MODE[user_id] = "add"
+        await callback.answer()
+        await callback.message.answer(
+            "Введи операцию для добавления:\n"
+            "• <code>деп 7000 25.11.2026 18:10 сбп</code> (попадёт в Депозиты +)\n"
+            "• <code>выв 5000 26.11.2026 14:30 карта</code> (попадёт в Выводы -)\n\n"
+            "Дату, время и способ можно не писать — подставятся текущие и СБП.\n"
+            "Для отмены: /cancel",
+            parse_mode="HTML",
+        )
+        return
+
+    if action == "filter":
+        clear_active_inputs(user_id)
+        EDIT_MODE[user_id] = "filter"
+        await callback.answer()
+        await callback.message.answer(
+            "Введи условие фильтра (можно комбинировать):\n"
+            "• По сумме: <code>от 3000</code> или <code>от 2000 до 15000</code>\n"
+            "• По датам: <code>25.11.2026-26.11.2026</code> или <code>26.11.2026</code>\n"
+            "• Вместе: <code>25.11.2026-26.11.2026 от 5000</code>\n\n"
+            "Для отмены: /cancel",
+            parse_mode="HTML",
+        )
+        return
+
+    if action == "reset":
+        clear_active_inputs(user_id)
+        orig = LAST_TRANSFERS_ORIG.get(user_id)
+        if not orig:
+            await callback.answer("Исходный список не найден.", show_alert=True)
+            return
+        LAST_TRANSFERS[user_id] = copy.deepcopy(orig)
+        await callback.answer("Правки сброшены")
+        text, kb = build_edit_menu(user_id)
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+        return
+
+    if action == "done":
+        clear_active_inputs(user_id)
+        transfers = LAST_TRANSFERS.get(user_id, [])
+        if not transfers:
+            await callback.answer("В списке не осталось операций.", show_alert=True)
+            return
+        await callback.answer("Пересобираю Excel...")
+        excel_bytes = build_excel(transfers)
+        stem = LAST_PDF_STEM.get(user_id, "edited")
+        caption = build_transfers_caption(transfers)
+        await callback.message.answer_document(
+            BufferedInputFile(excel_bytes, filename=f"transfers_{stem}_edited.xlsx"),
+            caption=caption,
+            reply_markup=build_action_keyboard(transfers),
+        )
+        return
+
+
 @dp.callback_query(F.data.startswith("ep:"))
 async def handle_ep_action(callback: types.CallbackQuery):
     if not is_allowed_user(callback.from_user):
@@ -3137,6 +3798,18 @@ async def handle_ep_action(callback: types.CallbackQuery):
         await callback.answer()
         text, kb = build_ep_menu(user_id)
         await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+        return
+
+    if action == "get_png":
+        png_bytes = LAST_SIGNED_PNG.get(user_id)
+        if not png_bytes:
+            await callback.answer("Подписанный PNG не найден.", show_alert=True)
+            return
+        await callback.answer()
+        await callback.message.answer_document(
+            BufferedInputFile(png_bytes, filename="signed_blank.png"),
+            caption="Подписанный бланк в PNG без сжатия.",
+        )
         return
 
     if action in ("pos_left", "pos_center", "pos_right"):
@@ -3166,7 +3839,12 @@ async def handle_ep_action(callback: types.CallbackQuery):
     if action == "apply_from_blank":
         ep = load_ep_settings()
         meta = LAST_BLANK_META.get(user_id) or {}
-        if meta.get("agent_name"):
+        tpl_ep = meta.get("tpl_ep")
+        if isinstance(tpl_ep, dict):
+            for k in ("owner", "cert", "ca", "valid_from", "valid_to"):
+                if tpl_ep.get(k):
+                    ep[k] = tpl_ep[k]
+        elif meta.get("agent_name"):
             ep["owner"] = meta["agent_name"]
         if meta.get("issue_date"):
             ep["signed_date"] = meta["issue_date"]
@@ -3212,6 +3890,18 @@ async def handle_blank_callback(callback: types.CallbackQuery):
 
     user_id = callback.from_user.id
     action = callback.data.split(":", 1)[1]
+
+    if action == "get_png":
+        pages = LAST_BLANK_PAGES.get(user_id)
+        if not pages:
+            await callback.answer("Бланк не найден.", show_alert=True)
+            return
+        await callback.answer()
+        await callback.message.answer_document(
+            BufferedInputFile(pages[-1], filename="knd_1175018.png"),
+            caption="Бланк КНД 1175018 в PNG без сжатия.",
+        )
+        return
 
     if action == "cancel":
         BLANK_SESSIONS.pop(user_id, None)
@@ -3276,32 +3966,116 @@ async def handle_text_input(message: types.Message):
     if not is_allowed_user(message.from_user) or not message.from_user:
         return
     user_id = message.from_user.id
+    raw_text = (message.text or "").strip()
 
-    # 1. Активная настройка ЭП
+    # 1. Добавление шаблона налогового агента
+    if user_id in WAITING_AGENT_ADD:
+        lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+        if not lines:
+            await message.answer("Пришли хотя бы название компании или /cancel.")
+            return
+        agent_name = lines[0]
+        details = parse_agent_details("\n".join(lines[1:])) if len(lines) > 1 else {}
+        ep = load_ep_settings()
+        tpl = upsert_agent_template(
+            {
+                "agent_name": agent_name,
+                "oktmo": details.get("oktmo", ""),
+                "agent_phone": details.get("agent_phone", ""),
+                "agent_inn": details.get("agent_inn", ""),
+                "agent_kpp": details.get("agent_kpp", ""),
+                "ep_owner": agent_name.upper(),
+                "ep_cert": generate_cert_hex(),
+                "ep_ca": ep.get("ca", "Федеральная налоговая служба"),
+                "ep_valid_from": ep.get("valid_from", "24.01.2026"),
+                "ep_valid_to": ep.get("valid_to", "24.10.2027"),
+            }
+        )
+        WAITING_AGENT_ADD.discard(user_id)
+        text, kb = build_agents_menu()
+        await message.answer(
+            f"Шаблон <b>{html.escape(tpl['agent_name'])}</b> добавлен!\n\n" + text,
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        return
+
+    # 2. Правка списка операций
+    if user_id in EDIT_MODE:
+        mode = EDIT_MODE[user_id]
+        transfers = LAST_TRANSFERS.get(user_id, [])
+
+        if mode == "del":
+            new_list, removed = apply_edit_delete(transfers, raw_text)
+            if removed == 0:
+                await message.answer("Не найдено подходящих номеров строк. Попробуй снова или /cancel.")
+                return
+            LAST_TRANSFERS[user_id] = new_list
+            EDIT_MODE.pop(user_id, None)
+            text, kb = build_edit_menu(user_id)
+            await message.answer(f"Удалено строк: {removed}.\n\n" + text, reply_markup=kb, parse_mode="HTML")
+            return
+
+        if mode == "add":
+            item = apply_edit_add(raw_text)
+            if not item:
+                await message.answer(
+                    "Не удалось разобрать строку.\nПример: <code>деп 7000 25.11.2026 18:10 сбп</code>",
+                    parse_mode="HTML",
+                )
+                return
+            transfers.append(item)
+            transfers.sort(key=transfer_sort_key, reverse=True)
+            LAST_TRANSFERS[user_id] = transfers
+            EDIT_MODE.pop(user_id, None)
+            text, kb = build_edit_menu(user_id)
+            await message.answer("Операция добавлена.\n\n" + text, reply_markup=kb, parse_mode="HTML")
+            return
+
+        if mode == "filter":
+            res = apply_edit_filter(transfers, raw_text)
+            if res is None:
+                await message.answer(
+                    "Не распознано условие.\nПример: <code>25.11.2026-26.11.2026 от 3000</code>",
+                    parse_mode="HTML",
+                )
+                return
+            new_list, desc_filter = res
+            LAST_TRANSFERS[user_id] = new_list
+            EDIT_MODE.pop(user_id, None)
+            text, kb = build_edit_menu(user_id)
+            await message.answer(
+                f"Применён фильтр ({html.escape(desc_filter)}). Осталось: {len(new_list)} шт.\n\n" + text,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            return
+
+    # 3. Активная настройка ЭП
     if user_id in EP_SESSIONS:
         session = EP_SESSIONS[user_id]
-        err = apply_ep_step(session, user_id, message.text, action="text")
+        err = apply_ep_step(session, user_id, raw_text, action="text")
         if err:
             await message.answer(err, parse_mode="HTML")
             return
         await send_ep_step_or_finish(message, user_id)
         return
 
-    # 2. Активное заполнение бланка КНД 1175018
+    # 4. Активное заполнение бланка КНД 1175018
     if user_id in BLANK_SESSIONS:
         session = BLANK_SESSIONS[user_id]
-        err = apply_blank_step(session, message.text, action="text")
+        err = apply_blank_step(session, raw_text, action="text")
         if err:
             await message.answer(err, parse_mode="HTML")
             return
         await send_blank_step_or_finish(message, user_id)
         return
 
-    # 3. Ввод данных для скриншота профиля
+    # 5. Ввод данных для скриншота профиля
     if user_id not in WAITING_PROFILE:
         return
 
-    parsed = parse_profile_input(message.text or "")
+    parsed = parse_profile_input(raw_text)
     if not any(k in parsed for k in ("phone", "email", "dob", "name")):
         await message.answer(
             "Не удалось распознать телефон или почту. Пришли их в одном сообщении "
