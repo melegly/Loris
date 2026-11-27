@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import tempfile
 import zlib
 
 from aiogram import Bot, Dispatcher, F, types
@@ -19,6 +20,19 @@ import openpyxl
 from openpyxl.styles import Alignment, Font
 import pdfplumber
 from PIL import Image, ImageChops, ImageDraw, ImageFont
+
+try:
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+    from pyhanko.sign import fields as pyhanko_fields
+    from pyhanko.sign import signers as pyhanko_signers
+
+    PADES_AVAILABLE = True
+except ImportError:
+    PADES_AVAILABLE = False
 
 # --- НАСТРОЙКИ (задаются в "Переменных окружения" на хостинге) ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -58,6 +72,7 @@ DEFAULT_EP = {
     "valid_to": "24.10.2027",
     "signed_date": "auto",  # "auto" (дата бланка/сегодня) или "ДД.ММ.ГГГГ"
     "position": "center",  # "left", "center", "right"
+    "pades_enabled": True,
 }
 
 # Кэш операций, бланков и активных режимов ввода (по user_id)
@@ -229,7 +244,7 @@ def upsert_agent_template(agent_data: dict) -> dict:
 
 
 def generate_cert_hex() -> str:
-    return secrets.token_hex(16).upper()
+    return f"{secrets.randbits(127):032X}"
 
 
 def clear_active_inputs(user_id: int | None) -> None:
@@ -354,7 +369,6 @@ def extract_client_name(first_page_text: str) -> str:
 
 
 def extract_client_passport(first_page_text: str) -> str:
-    """Извлекает серию и номер паспорта из шапки PDF-выписки Т-Банка."""
     header = re.split(
         r"движение\s+средств", first_page_text, maxsplit=1, flags=re.IGNORECASE
     )[0]
@@ -1068,7 +1082,6 @@ def draw_ios_battery(img: Image.Image, left_x: int, bottom_y: int, battery: int)
 
 
 def draw_home_indicator(draw: ImageDraw.ImageDraw, W: int, H: int) -> None:
-    """Нижняя полоса Home Indicator в стиле iPhone."""
     bar_w = 420
     bar_h = 15
     x0 = (W - bar_w) // 2
@@ -1267,7 +1280,6 @@ def build_screenshots(
 
         img = Image.new("RGB", (W, H), (14, 16, 20))
         draw = ImageDraw.Draw(img)
-        # Автосмещение времени на +1 мин на каждый следующий скрин в серии
         sheet_top = draw_sheet_header(
             img,
             draw,
@@ -2066,7 +2078,7 @@ def build_knd_1175018_png(data: dict) -> bytes:
     return buf.getvalue()
 
 
-# ---------------- ШТАМП ЭЛЕКТРОННОЙ ПОДПИСИ ----------------
+# ---------------- ШТАМП ЭП И КРИПТОПОДПИСЬ PAdES ----------------
 
 def resolve_signed_date(ep: dict, blank_meta: dict | None = None) -> str:
     sd = (ep.get("signed_date") or "auto").strip()
@@ -2175,6 +2187,188 @@ def apply_ep_stamp_to_image(
     return out.getvalue()
 
 
+def _parse_ep_date_utc(date_str: str, end_of_day: bool = False) -> datetime | None:
+    try:
+        dt = datetime.strptime(date_str.strip(), "%d.%m.%Y")
+        if end_of_day:
+            return dt.replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+        return dt.replace(hour=0, minute=0, second=0, tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _set_cert_validity(builder, dt_from: datetime, dt_to: datetime):
+    if hasattr(builder, "not_valid_before_utc"):
+        return builder.not_valid_before_utc(dt_from).not_valid_after_utc(dt_to)
+    return builder.not_valid_before(dt_from.replace(tzinfo=None)).not_valid_after(
+        dt_to.replace(tzinfo=None)
+    )
+
+
+def _build_pades_pem_bundle(ep: dict) -> tuple[bytes, bytes, bytes]:
+    """
+    Генерирует самоподписанную цепочку X.509 (УЦ -> Подписант) на основе
+    реквизитов ЭП: владелец, серийный номер, УЦ и срок действия.
+    """
+    owner_str = (ep.get("owner") or "Подписант").strip()[:120]
+    ca_str = (ep.get("ca") or "Федеральная налоговая служба").strip()[:120]
+
+    now_utc = datetime.now(timezone.utc)
+    dt_from = _parse_ep_date_utc(ep.get("valid_from", ""), end_of_day=False) or (
+        now_utc - timedelta(days=90)
+    )
+    dt_to = _parse_ep_date_utc(ep.get("valid_to", ""), end_of_day=True) or (
+        now_utc + timedelta(days=365)
+    )
+    if dt_to <= dt_from:
+        dt_to = dt_from + timedelta(days=365)
+
+    ca_from = dt_from - timedelta(days=365)
+    ca_to = dt_to + timedelta(days=365 * 5)
+
+    raw_hex = re.sub(r"[^0-9A-Fa-f]", "", ep.get("cert") or "")
+    serial_int = 0
+    if raw_hex:
+        try:
+            serial_int = int(raw_hex[:38], 16)
+        except ValueError:
+            serial_int = 0
+    if serial_int <= 0:
+        serial_int = x509.random_serial_number()
+
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    signer_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    ca_subject = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "RU"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, ca_str),
+            x509.NameAttribute(NameOID.COMMON_NAME, ca_str),
+        ]
+    )
+    ca_serial = x509.random_serial_number()
+    if ca_serial == serial_int:
+        ca_serial += 1
+
+    ca_builder = (
+        x509.CertificateBuilder()
+        .subject_name(ca_subject)
+        .issuer_name(ca_subject)
+        .public_key(ca_key.public_key())
+        .serial_number(ca_serial)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()),
+            critical=False,
+        )
+    )
+    ca_builder = _set_cert_validity(ca_builder, ca_from, ca_to)
+    ca_cert = ca_builder.sign(private_key=ca_key, algorithm=hashes.SHA256())
+
+    signer_subject = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "RU"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, owner_str),
+            x509.NameAttribute(NameOID.COMMON_NAME, owner_str),
+        ]
+    )
+    signer_builder = (
+        x509.CertificateBuilder()
+        .subject_name(signer_subject)
+        .issuer_name(ca_cert.subject)
+        .public_key(signer_key.public_key())
+        .serial_number(serial_int)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=True,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(signer_key.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+            critical=False,
+        )
+    )
+    signer_builder = _set_cert_validity(signer_builder, dt_from, dt_to)
+    signer_cert = signer_builder.sign(private_key=ca_key, algorithm=hashes.SHA256())
+
+    key_pem = signer_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    cert_pem = signer_cert.public_bytes(serialization.Encoding.PEM)
+    ca_pem = ca_cert.public_bytes(serialization.Encoding.PEM)
+    return key_pem, cert_pem, ca_pem
+
+
+async def sign_pdf_with_pades(pdf_bytes: bytes, ep: dict) -> bytes:
+    """Вшивает в PDF криптографическую подпись стандарта PAdES-B-B (/Type /Sig)."""
+    key_pem, cert_pem, ca_pem = await asyncio.to_thread(_build_pades_pem_bundle, ep)
+
+    owner_str = (ep.get("owner") or "Подписант").strip()
+    sig_meta = pyhanko_signers.PdfSignatureMetadata(
+        field_name="Signature1",
+        md_algorithm="sha256",
+        subfilter=pyhanko_fields.SigSeedSubFilter.PADES,
+        name=owner_str,
+        reason="Документ подписан электронной подписью",
+        location="Российская Федерация",
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        key_path = tmp / "signer.key"
+        cert_path = tmp / "signer.pem"
+        ca_path = tmp / "ca.pem"
+        key_path.write_bytes(key_pem)
+        cert_path.write_bytes(cert_pem)
+        ca_path.write_bytes(ca_pem)
+
+        cms_signer = pyhanko_signers.SimpleSigner.load(
+            str(key_path),
+            str(cert_path),
+            ca_chain_files=(str(ca_path),),
+        )
+        in_buf = io.BytesIO(pdf_bytes)
+        out_buf = io.BytesIO()
+        writer = IncrementalPdfFileWriter(in_buf, strict=False)
+        await pyhanko_signers.async_sign_pdf(
+            writer,
+            sig_meta,
+            signer=cms_signer,
+            output=out_buf,
+        )
+        return out_buf.getvalue()
+
+
 def normalize_uploaded_image(raw_bytes: bytes) -> bytes:
     raw = Image.open(io.BytesIO(raw_bytes))
     if raw.mode in ("RGBA", "LA") or (raw.mode == "P" and "transparency" in raw.info):
@@ -2269,13 +2463,6 @@ def apply_edit_delete(transfers: list[dict], text: str) -> tuple[list[dict], int
 
 
 def apply_edit_add(text: str) -> dict | None:
-    """
-    Форматы:
-      деп 7000 25.11.2026 18:10 сбп
-      выв 5000 26.11.2026 14:30 карта
-      -7000 25.11.2026 18:10 сбп
-      +5000 26.11.2026 14:30 карта
-    """
     raw = text.strip()
     low = raw.lower()
 
@@ -2484,9 +2671,17 @@ def build_ep_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     pages = LAST_BLANK_PAGES.get(user_id)
     has_blank = bool(pages)
     pos_cur = ep.get("position", "center")
+    pades_on = bool(ep.get("pades_enabled", True))
     pos_labels = {"left": "Снизу слева", "center": "Снизу по центру", "right": "Снизу справа"}
     signed_preview = resolve_signed_date(ep, meta)
     signed_note = " (авто)" if (ep.get("signed_date") or "auto").lower() == "auto" else ""
+
+    if not PADES_AVAILABLE:
+        pades_status = "НЕ УСТАНОВЛЕН (обнови requirements.txt)"
+    elif pades_on:
+        pades_status = "ВКЛ (самоподписанный PAdES-B-B / SHA-256)"
+    else:
+        pades_status = "ВЫКЛ (только визуальный штамп)"
 
     text = (
         "<b>Электронная подпись (ЭП)</b>\n\n"
@@ -2496,6 +2691,7 @@ def build_ep_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         f"• Действителен: <code>с {html.escape(ep.get('valid_from', ''))} "
         f"по {html.escape(ep.get('valid_to', ''))}, подписан: {html.escape(signed_preview)}</code>{signed_note}\n"
         f"• Позиция: <code>{pos_labels.get(pos_cur, 'Снизу по центру')}</code>\n"
+        f"• Криптоблок PDF: <code>{pades_status}</code>\n"
     )
 
     rows: list[list[InlineKeyboardButton]] = []
@@ -2530,6 +2726,14 @@ def build_ep_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
                 text=("• Справа" if pos_cur == "right" else "Справа"),
                 callback_data="ep:pos_right",
             ),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=f"PAdES-криптоблок: {'ВКЛ' if pades_on else 'ВЫКЛ'}",
+                callback_data="ep:toggle_pades",
+            )
         ]
     )
     rows.append([InlineKeyboardButton(text="Настроить реквизиты ЭП", callback_data="ep:edit")])
@@ -2637,12 +2841,31 @@ async def send_signed_blank(message: types.Message, user_id: int, ep_override: d
 
     ep = ep_override if ep_override is not None else load_ep_settings()
     meta = LAST_BLANK_META.get(user_id)
-    wait_msg = await message.answer("Накладываю электронную подпись и собираю PDF...")
+    use_pades = bool(ep.get("pades_enabled", True)) and PADES_AVAILABLE
+    wait_msg = await message.answer(
+        "Накладываю штамп и вшиваю PAdES-подпись в PDF..."
+        if use_pades
+        else "Накладываю штамп и собираю PDF..."
+    )
     try:
         signed_last_png = apply_ep_stamp_to_image(pages[-1], ep, blank_meta=meta)
         LAST_SIGNED_PNG[user_id] = signed_last_png
         signed_pages = pages[:-1] + [signed_last_png]
         signed_pdf = images_to_pdf_bytes(signed_pages, resolution=200.0)
+
+        pades_note = "PDF со штампом (без криптоблока)."
+        if use_pades:
+            try:
+                signed_pdf = await sign_pdf_with_pades(signed_pdf, ep)
+                pades_note = (
+                    f"Вшита самоподписанная криптоподпись PAdES-B-B (SHA-256).\n"
+                    f"Сертификат: {ep.get('cert', '')}"
+                )
+            except Exception as pades_err:
+                logging.exception("Ошибка PAdES-подписи")
+                pades_note = f"Штамп наложен, но криптоблок PAdES не добавлен: {pades_err}"
+        elif ep.get("pades_enabled", True) and not PADES_AVAILABLE:
+            pades_note = "Штамп наложен (для криптоблока PAdES добавь cryptography и pyHanko в requirements.txt)."
 
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -2659,7 +2882,7 @@ async def send_signed_blank(message: types.Message, user_id: int, ep_override: d
         )
         await message.answer_document(
             BufferedInputFile(signed_pdf, filename="signed_blank.pdf"),
-            caption="Подписанный PDF. Можно прислать другой бланк (PDF или картинку) либо нажать /blank.",
+            caption=pades_note,
         )
         await wait_msg.delete()
     except Exception as e:
@@ -3140,7 +3363,6 @@ def apply_blank_step(session: dict, raw_text: str | None, action: str = "text") 
                 "valid_from": tpl.get("ep_valid_from", ""),
                 "valid_to": tpl.get("ep_valid_to", ""),
             }
-        # Пропускаем и agent_name, и agent_details
         session["step_idx"] += 2
         return None
 
@@ -3278,22 +3500,24 @@ async def cmd_start(message: types.Message):
     sbp_p = get_sbp_asset_path()
     f_reg = get_font_asset_path(bold=False)
     f_bold = get_font_asset_path(bold=True)
+    pades_lbl = "активна (PAdES-B-B)" if PADES_AVAILABLE else "не установлена (обнови requirements.txt)"
 
     assets_info = (
-        "Файлы на сервере:\n"
+        "Система и файлы на сервере:\n"
         f"• СБП: {html.escape(sbp_p.name) if sbp_p else 'НЕ НАЙДЕН (используется заглушка)'}\n"
         f"• Шрифты: {html.escape(f_reg.name) if f_reg else 'системный'} / "
-        f"{html.escape(f_bold.name) if f_bold else 'системный'}"
+        f"{html.escape(f_bold.name) if f_bold else 'системный'}\n"
+        f"• Криптоподпись PDF: {pades_lbl}"
     )
     await message.answer(
         "• Кидай <b>PDF-выписку из Т-Банка</b> — верну Excel, правку списка и PNG-скриншоты.\n"
-        "• Кидай <b>готовый бланк (PDF, фото или PNG/JPG)</b> — предложу подписать его настраиваемой ЭП.\n\n"
+        "• Кидай <b>готовый бланк (PDF, фото или PNG/JPG)</b> — предложу подписать его штампом + PAdES.\n\n"
         f"Настройки скрина: домен <code>{html.escape(ui['domain'])}</code>, "
         f"часы <code>{html.escape(str(ui['status_time']))}</code>, заряд <code>{ui['battery']}%</code>\n"
         f"{assets_info}\n\n"
         "Команды:\n"
         "/blank — заполнить бланк справки о доходах (PDF + PNG)\n"
-        "/sign — настроить ЭП и подписать бланк\n"
+        "/sign — настроить ЭП / PAdES и подписать бланк\n"
         "/agents — шаблоны налоговых агентов (компаний)\n"
         "/edit — править список операций из последней выписки\n"
         "/profile — сделать скриншот профиля (Настройки)\n"
@@ -3514,7 +3738,6 @@ async def handle_document(message: types.Message, bot: Bot):
         await bot.download_file(file_info.file_path, buf)
         pdf_bytes = buf.getvalue()
 
-        # Если это не выписка Т-Банка — считаем, что прислали PDF-бланк для подписи ЭП
         if not is_tbank_statement_pdf(pdf_bytes):
             await wait_msg.edit_text("Готовлю PDF-бланк к подписи...")
             pages_png = render_pdf_to_png_pages(pdf_bytes, resolution=200)
@@ -3810,6 +4033,20 @@ async def handle_ep_action(callback: types.CallbackQuery):
             BufferedInputFile(png_bytes, filename="signed_blank.png"),
             caption="Подписанный бланк в PNG без сжатия.",
         )
+        return
+
+    if action == "toggle_pades":
+        ep = load_ep_settings()
+        ep["pades_enabled"] = not bool(ep.get("pades_enabled", True))
+        save_ep_settings(ep)
+        await callback.answer(
+            "PAdES-криптоблок включён" if ep["pades_enabled"] else "PAdES-криптоблок выключен"
+        )
+        text, kb = build_ep_menu(user_id)
+        try:
+            await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
         return
 
     if action in ("pos_left", "pos_center", "pos_right"):
