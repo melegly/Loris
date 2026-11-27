@@ -531,8 +531,7 @@ def make_seconds(row: dict) -> str:
     return f"{base_time}:{sec:02d}"
 
 
-def draw_default_card_icon(width: int = 114, height: int = 80) -> Image.Image:
-    """Рисует значок карты как на примере: тёмно-синий корпус, полоса, золотой чип и 2 кружка."""
+def draw_default_card_icon(width: int = 108, height: int = 76) -> Image.Image:
     scale = 4
     w, h = width * scale, height * scale
     card = Image.new("RGBA", (w, h), (0, 0, 0, 0))
@@ -540,18 +539,13 @@ def draw_default_card_icon(width: int = 114, height: int = 80) -> Image.Image:
 
     radius = int(h * 0.16)
     d.rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=(34, 44, 86, 255))
-
-    # Тёмная полоса сверху
     d.rectangle([0, int(h * 0.20), w - 1, int(h * 0.37)], fill=(20, 27, 56, 255))
-
-    # Золотой чип слева снизу
     d.rounded_rectangle(
         [int(w * 0.11), int(h * 0.56), int(w * 0.33), int(h * 0.80)],
         radius=int(h * 0.065),
         fill=(238, 192, 86, 255),
     )
 
-    # Перекрывающиеся красный и оранжевый кружки справа снизу
     r = int(h * 0.165)
     cy = int(h * 0.68)
     cx1 = int(w * 0.65)
@@ -559,7 +553,6 @@ def draw_default_card_icon(width: int = 114, height: int = 80) -> Image.Image:
     d.ellipse([cx1 - r, cy - r, cx1 + r, cy + r], fill=(234, 42, 42, 255))
     d.ellipse([cx2 - r, cy - r, cx2 + r, cy + r], fill=(242, 160, 44, 240))
 
-    # Чистая обрезка по скруглённым углам карты
     mask = Image.new("L", (w, h), 0)
     ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=255)
     card.putalpha(mask)
@@ -599,14 +592,14 @@ def trim_icon_margins(raw: Image.Image) -> Image.Image:
     return raw
 
 
-def load_icon(kind: str, max_w: int = 142, max_h: int = 92) -> Image.Image:
+def load_icon(kind: str, max_w: int = 142, max_h: int = 90) -> Image.Image:
     if kind == "card":
         p = get_card_asset_path()
         if p:
             raw = trim_icon_margins(Image.open(p).convert("RGBA"))
-            raw.thumbnail((114, 80), Image.Resampling.LANCZOS)
+            raw.thumbnail((108, 76), Image.Resampling.LANCZOS)
             return raw
-        return draw_default_card_icon(114, 80)
+        return draw_default_card_icon(108, 76)
 
     p = get_sbp_asset_path()
     raw = Image.open(p).convert("RGBA") if p else draw_default_sbp_icon()
@@ -616,7 +609,6 @@ def load_icon(kind: str, max_w: int = 142, max_h: int = 92) -> Image.Image:
 
 
 def draw_ios_signal(img: Image.Image, left_x: int, bottom_y: int) -> None:
-    """Рисует 4 белых скруглённых столбика сети iOS."""
     scale = 4
     w, h = 56, 40
     layer = Image.new("RGBA", (w * scale, h * scale), (0, 0, 0, 0))
@@ -641,7 +633,6 @@ def draw_ios_signal(img: Image.Image, left_x: int, bottom_y: int) -> None:
 
 
 def draw_ios_wifi(img: Image.Image, center_x: int, bottom_y: int) -> None:
-    """Рисует иконку Wi-Fi iOS: нижний сектор + 2 толстые сглаженные дуги."""
     scale = 6
     w, h = 56, 42
     W_s, H_s = w * scale, h * scale
@@ -653,7 +644,6 @@ def draw_ios_wifi(img: Image.Image, center_x: int, bottom_y: int) -> None:
 
     a1, a2 = 226, 314
 
-    # Нижний сплошной сектор-капля
     r0 = 10.6 * scale
     md.pieslice([cx - r0, cy - r0, cx + r0, cy + r0], start=a1, end=a2, fill=255)
     r_tip = 2.0 * scale
@@ -662,7 +652,6 @@ def draw_ios_wifi(img: Image.Image, center_x: int, bottom_y: int) -> None:
         fill=255,
     )
 
-    # Две толстые дуги
     for r_in_base, r_out_base in ((16.2, 23.0), (28.6, 35.4)):
         r_in = r_in_base * scale
         r_out = r_out_base * scale
@@ -688,7 +677,6 @@ def draw_ios_wifi(img: Image.Image, center_x: int, bottom_y: int) -> None:
 
 
 def draw_ios_battery(img: Image.Image, left_x: int, bottom_y: int, battery: int) -> None:
-    """Рисует сплошную iOS-батарею с процентами (как на примере 76)."""
     scale = 4
     bat_w, bat_h = 74, 37
     cw, ch = 84, 42
@@ -716,7 +704,6 @@ def draw_ios_battery(img: Image.Image, left_x: int, bottom_y: int, battery: int)
 
     bd = ImageDraw.Draw(bat_img, "RGBA")
 
-    # Цифры процентов по центру капсулы
     font_bat = load_font(27 * scale, bold=True)
     bat_text = str(pct)
     tb = bd.textbbox((0, 0), bat_text, font=font_bat)
@@ -726,7 +713,6 @@ def draw_ios_battery(img: Image.Image, left_x: int, bottom_y: int, battery: int)
     ty = top_pad + (bat_h * scale - th) / 2 - tb[1]
     bd.text((tx, ty), bat_text, fill=txt_color, font=font_bat)
 
-    # Контакт-выступ справа (D-форма)
     nub_x0 = int((bat_w + 3.0) * scale)
     nub_x1 = int((bat_w + 7.5) * scale)
     nub_h = 13 * scale
@@ -744,7 +730,7 @@ def draw_ios_battery(img: Image.Image, left_x: int, bottom_y: int, battery: int)
 
 
 def draw_status_bar(img: Image.Image, draw: ImageDraw.ImageDraw, W: int, time_str: str, battery: int) -> None:
-    font_time = load_font(42, bold=True)
+    font_time = load_font(45, bold=True)
     tb = draw.textbbox((0, 0), time_str, font=font_time)
     th = tb[3] - tb[1]
     draw.text((135, 62 - th / 2 - tb[1]), time_str, fill=(255, 255, 255), font=font_time)
@@ -763,10 +749,10 @@ def draw_browser_bar(draw: ImageDraw.ImageDraw, W: int, domain: str) -> None:
     draw.rounded_rectangle([lx - 18, ly - 18, lx + 18, ly + 18], radius=7, outline=(215, 218, 224), width=4)
     draw.ellipse([lx - 6, ly - 6, lx + 6, ly + 6], fill=(215, 218, 224))
 
-    font_dom = load_font(34, bold=False)
+    font_dom = load_font(37, bold=False)
     tb = draw.textbbox((0, 0), domain, font=font_dom)
     tw, th = tb[2] - tb[0], tb[3] - tb[1]
-    draw.text(((W - tw) / 2, (y0 + y1 - th) / 2 - tb[1]), domain, fill=(225, 228, 232), font=font_dom)
+    draw.text(((W - tw) / 2, (y0 + y1 - th) / 2 - tb[1]), domain, fill=(228, 231, 236), font=font_dom)
 
     sx, sy = x1 - 52, (y0 + y1) // 2
     draw.rounded_rectangle([sx - 16, sy - 6, sx + 16, sy + 20], radius=4, outline=(215, 218, 224), width=4)
@@ -775,7 +761,7 @@ def draw_browser_bar(draw: ImageDraw.ImageDraw, W: int, domain: str) -> None:
 
 
 def draw_checkmark(draw: ImageDraw.ImageDraw, x: int, y: int, color=(46, 158, 91)) -> None:
-    draw.line([(x, y + 14), (x + 10, y + 24), (x + 26, y + 6)], fill=color, width=5, joint="curve")
+    draw.line([(x, y + 16), (x + 11, y + 27), (x + 30, y + 7)], fill=color, width=6, joint="curve")
 
 
 def build_screenshots(
@@ -805,16 +791,16 @@ def build_screenshots(
         msk = timezone(timedelta(hours=3))
         status_time = datetime.now(msk).strftime("%H:%M")
 
-    sbp_icon = load_icon("sbp", max_w=142, max_h=92)
-    card_icon = load_icon("card", max_w=114, max_h=80)
+    sbp_icon = load_icon("sbp", max_w=142, max_h=90)
+    card_icon = load_icon("card", max_w=108, max_h=76)
 
-    font_back = load_font(40, bold=False)
-    font_title = load_font(62, bold=True)
-    font_tab = load_font(38, bold=True)
-    font_row_title = load_font(40, bold=True)
-    font_status = load_font(33, bold=False)
-    font_amount = load_font(40, bold=True)
-    font_meta = load_font(32, bold=False)
+    font_back = load_font(45, bold=True)
+    font_title = load_font(72, bold=True)
+    font_tab = load_font(44, bold=True)
+    font_row_title = load_font(47, bold=True)
+    font_status = load_font(38, bold=False)
+    font_amount = load_font(46, bold=True)
+    font_meta = load_font(37, bold=False)
 
     pages: list[bytes] = []
 
@@ -830,18 +816,18 @@ def build_screenshots(
         sheet_top = 285
         draw.rounded_rectangle([0, sheet_top, W, H + 80], radius=64, fill=(255, 255, 255))
 
-        bx, by = 64, sheet_top + 66
-        draw.line([(bx + 18, by), (bx, by + 18), (bx + 18, by + 36)], fill=(27, 102, 224), width=6, joint="curve")
-        draw.text((bx + 40, by - 6), "Назад", fill=(27, 102, 224), font=font_back)
+        bx, by = 62, sheet_top + 64
+        draw.line([(bx + 20, by), (bx, by + 20), (bx + 20, by + 40)], fill=(27, 102, 224), width=6, joint="curve")
+        draw.text((bx + 44, by - 7), "Назад", fill=(27, 102, 224), font=font_back)
 
         cx, cy = W - 82, sheet_top + 84
-        draw.line([(cx - 18, cy - 18), (cx + 18, cy + 18)], fill=(45, 52, 66), width=5)
-        draw.line([(cx + 18, cy - 18), (cx - 18, cy + 18)], fill=(45, 52, 66), width=5)
+        draw.line([(cx - 19, cy - 19), (cx + 19, cy + 19)], fill=(45, 52, 66), width=5)
+        draw.line([(cx + 19, cy - 19), (cx - 19, cy + 19)], fill=(45, 52, 66), width=5)
 
-        draw.text((56, sheet_top + 180), "История платежей", fill=(17, 24, 39), font=font_title)
+        draw.text((54, sheet_top + 172), "История платежей", fill=(17, 24, 39), font=font_title)
 
-        tab_y0, tab_y1 = sheet_top + 305, sheet_top + 425
-        tab_x0, tab_x1 = 56, W - 56
+        tab_y0, tab_y1 = sheet_top + 308, sheet_top + 436
+        tab_x0, tab_x1 = 54, W - 54
         draw.rounded_rectangle([tab_x0, tab_y0, tab_x1, tab_y1], radius=28, fill=(246, 247, 249))
 
         tab_names = ("Все", "Депозиты", "Выводы")
@@ -864,8 +850,8 @@ def build_screenshots(
                 font=font_tab,
             )
 
-        list_top = tab_y1 + 48
-        row_h = 248
+        list_top = tab_y1 + 38
+        row_h = 252
 
         for i, row in enumerate(chunk):
             ry = list_top + i * row_h
@@ -874,8 +860,8 @@ def build_screenshots(
             is_card = row["method"] == "По карте"
 
             icon = card_icon if is_card else sbp_icon
-            ix = 46 + (142 - icon.width) // 2
-            iy = ry + 54 + (92 - icon.height) // 2
+            ix = 44 + (142 - icon.width) // 2
+            iy = ry + 48 + (92 - icon.height) // 2
             img.paste(icon, (ix, iy), icon)
 
             if is_deposit:
@@ -893,25 +879,29 @@ def build_screenshots(
                 )
                 amount_str = format_rub(abs(row["amount"]), "-")
 
-            tx = 212
-            draw.text((tx, ry + 24), title_lines[0], fill=(17, 24, 39), font=font_row_title)
-            draw.text((tx, ry + 76), title_lines[1], fill=(17, 24, 39), font=font_row_title)
+            tx = 206
+            draw.text((tx, ry + 18), title_lines[0], fill=(17, 24, 39), font=font_row_title)
+            draw.text((tx, ry + 78), title_lines[1], fill=(17, 24, 39), font=font_row_title)
 
-            draw_checkmark(draw, tx + 2, ry + 142)
-            draw.text((tx + 42, ry + 138), "Выполнено", fill=(46, 158, 91), font=font_status)
+            draw_checkmark(draw, tx + 2, ry + 148)
+            draw.text((tx + 46, ry + 143), "Выполнено", fill=(46, 158, 91), font=font_status)
 
             right_x = W - 52
 
             ab = draw.textbbox((0, 0), amount_str, font=font_amount)
-            draw.text((right_x - (ab[2] - ab[0]), ry + 26), amount_str, fill=(17, 24, 39), font=font_amount)
+            draw.text((right_x - (ab[2] - ab[0]), ry + 20), amount_str, fill=(17, 24, 39), font=font_amount)
 
             date_str = row["date"]
             db = draw.textbbox((0, 0), date_str, font=font_meta)
-            draw.text((right_x - (db[2] - db[0]), ry + 94), date_str, fill=(156, 163, 175), font=font_meta)
+            draw.text((right_x - (db[2] - db[0]), ry + 92), date_str, fill=(142, 149, 160), font=font_meta)
 
             time_str = make_seconds(row)
             tb_t = draw.textbbox((0, 0), time_str, font=font_meta)
-            draw.text((right_x - (tb_t[2] - tb_t[0]), ry + 142), time_str, fill=(156, 163, 175), font=font_meta)
+            draw.text((right_x - (tb_t[2] - tb_t[0]), ry + 146), time_str, fill=(142, 149, 160), font=font_meta)
+
+            if i < len(chunk) - 1:
+                sep_y = ry + row_h - 16
+                draw.line([(tx, sep_y), (right_x, sep_y)], fill=(242, 244, 247), width=2)
 
         buf = io.BytesIO()
         img.save(buf, format="PNG")
