@@ -1043,4 +1043,84 @@ async def handle_pdf(message: types.Message, bot: Bot):
         incoming = [t for t in transfers if t["amount"] > 0]
         outgoing = [t for t in transfers if t["amount"] < 0]
 
-        total_in =
+        total_in = sum(t["amount"] for t in incoming)
+        total_out = sum(t["amount"] for t in outgoing)
+        balance = total_in + total_out
+
+        method_counts = Counter(t["method"] for t in transfers)
+        methods_line = ", ".join(
+            f"{name} — {cnt}" for name, cnt in method_counts.most_common()
+        )
+
+        excel_bytes = build_excel(transfers)
+        out_name = f"transfers_{Path(doc.file_name).stem}.xlsx"
+
+        caption = (
+            f"Распознано переводов (всего): {total_recognized}\n"
+            f"Отсечено повторяющихся: {skipped_repeated}\n"
+            f"В таблице (разовых): {len(transfers)} ({methods_line})\n\n"
+            f"Входящие (→ Выводы): {len(incoming)} шт. (+{total_in:,.2f} ₽)\n"
+            f"Исходящие (→ Депозиты): {len(outgoing)} шт. ({total_out:,.2f} ₽)\n"
+            f"Разница: {balance:+,.2f} ₽"
+        ).replace(",", " ")
+
+        await message.answer_document(
+            BufferedInputFile(excel_bytes, filename=out_name),
+            caption=caption,
+            reply_markup=build_action_keyboard(transfers),
+        )
+        await wait_msg.delete()
+
+    except Exception as e:
+        logging.exception("Ошибка при разборе PDF")
+        await wait_msg.edit_text(f"Не удалось разобрать файл: {e}")
+
+
+@dp.callback_query(F.data.startswith("scr:"))
+async def handle_screenshots(callback: types.CallbackQuery):
+    if not is_allowed_user(callback.from_user):
+        await callback.answer()
+        return
+
+    user_id = callback.from_user.id
+    transfers = LAST_TRANSFERS.get(user_id)
+    if not transfers:
+        await callback.answer(
+            "Сначала закинь PDF-выписку заново (бот перезапускался).",
+            show_alert=True,
+        )
+        return
+
+    mode = callback.data.split(":", 1)[1]
+    labels = {"deposits": "Депозиты", "withdrawals": "Выводы", "all": "Все"}
+    label = labels.get(mode, "История")
+
+    await callback.answer(f"Генерирую скриншоты: {label}...")
+
+    try:
+        ui = load_ui_settings()
+        pages = build_screenshots(transfers, mode=mode, ui_settings=ui, per_page=7)
+        if not pages:
+            await callback.message.answer(f"Операций для вкладки «{label}» нет.")
+            return
+
+        total_pages = len(pages)
+        for idx, png_bytes in enumerate(pages, start=1):
+            await callback.message.answer_photo(
+                BufferedInputFile(png_bytes, filename=f"{mode}_{idx}.png"),
+                caption=f"{label} — скрин {idx}/{total_pages}",
+            )
+    except Exception as e:
+        logging.exception("Ошибка генерации PNG")
+        await callback.message.answer(f"Ошибка при создании PNG: {e}")
+
+
+async def main():
+    if not BOT_TOKEN:
+        raise ValueError("Не задан BOT_TOKEN в переменных окружения!")
+    bot = Bot(token=BOT_TOKEN)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
