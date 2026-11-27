@@ -54,7 +54,7 @@ DEFAULT_EP = {
     "valid_from": "24.01.2026",
     "valid_to": "24.10.2027",
     "signed_date": "auto",  # "auto" (дата бланка/сегодня) или "ДД.ММ.ГГГГ"
-    "position": "left",  # "left", "center", "right"
+    "position": "center",  # "left", "center", "right"
 }
 
 # Кэш последней выписки, последнего бланка и активных сессий ввода (по user_id)
@@ -1902,7 +1902,7 @@ def build_ep_stamp_image(
     blank_meta: dict | None = None,
 ) -> Image.Image:
     """
-    Рисует штамп ЭП в точном формате:
+    Рисует штамп ЭП на чисто белом фоне с тонкой чёрной рамкой:
       ДОКУМЕНТ ПОДПИСАН ЭЛЕКТРОННОЙ ПОДПИСЬЮ
       Владелец:  ...
       Сертификат: ...
@@ -1914,16 +1914,15 @@ def build_ep_stamp_image(
     ref_h = 204
     w, h = ref_w * scale, ref_h * scale
 
-    stamp = Image.new("RGBA", (w, h), (244, 245, 248, 255))
+    stamp = Image.new("RGBA", (w, h), (255, 255, 255, 255))
     d = ImageDraw.Draw(stamp)
 
-    # Тонкая рамка по периметру
-    border_color = (42, 46, 54, 255)
+    border_color = (24, 24, 24, 255)
     d.rectangle([0, 0, w - 1, h - 1], outline=border_color, width=2 * scale)
 
     pad_x = 26 * scale
     inner_w = w - 2 * pad_x
-    text_color = (20, 22, 26, 255)
+    text_color = (18, 18, 18, 255)
 
     owner = (ep.get("owner") or "").strip()
     cert = (ep.get("cert") or generate_cert_hex()).strip().upper()
@@ -1965,7 +1964,7 @@ def apply_ep_stamp_to_image(
     ep: dict,
     blank_meta: dict | None = None,
 ) -> bytes:
-    """Накладывает штамп ЭП в нижней части бланка (любой картинки)."""
+    """Накладывает штамп ЭП в нижней части бланка (по умолчанию по центру)."""
     raw = Image.open(io.BytesIO(img_bytes))
     if raw.mode in ("RGBA", "LA") or (raw.mode == "P" and "transparency" in raw.info):
         base = Image.new("RGB", raw.size, (255, 255, 255))
@@ -1976,11 +1975,10 @@ def apply_ep_stamp_to_image(
 
     W, H = base.size
 
-    # Для стандартного A4 (1654x2339) и других размеров подбираем аккуратную ширину
     if W == 1654 and H == 2339:
         stamp_w = 1120
         margin_x = 90
-        margin_bottom = 52
+        margin_bottom = 44
     else:
         ratio = 0.68 if W >= 1100 else 0.80
         stamp_w = int(W * ratio)
@@ -1989,13 +1987,13 @@ def apply_ep_stamp_to_image(
 
     stamp = build_ep_stamp_image(ep, target_width=stamp_w, blank_meta=blank_meta)
 
-    pos = ep.get("position", "left")
-    if pos == "center":
-        px = (W - stamp.width) // 2
+    pos = ep.get("position", "center")
+    if pos == "left":
+        px = margin_x
     elif pos == "right":
         px = max(margin_x, W - margin_x - stamp.width)
     else:
-        px = margin_x
+        px = (W - stamp.width) // 2
 
     py = max(10, H - margin_bottom - stamp.height)
     base.paste(stamp, (px, py), stamp)
@@ -2087,6 +2085,7 @@ def build_ep_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     ep = load_ep_settings()
     meta = LAST_BLANK_META.get(user_id)
     has_blank = user_id in LAST_BLANK_IMAGE
+    pos_cur = ep.get("position", "center")
     pos_labels = {"left": "Снизу слева", "center": "Снизу по центру", "right": "Снизу справа"}
     signed_preview = resolve_signed_date(ep, meta)
     signed_note = " (авто)" if (ep.get("signed_date") or "auto").lower() == "auto" else ""
@@ -2098,7 +2097,7 @@ def build_ep_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         f"• УЦ: <code>{html.escape(ep.get('ca', ''))}</code>\n"
         f"• Действителен: <code>с {html.escape(ep.get('valid_from', ''))} "
         f"по {html.escape(ep.get('valid_to', ''))}, подписан: {html.escape(signed_preview)}</code>{signed_note}\n"
-        f"• Позиция: <code>{pos_labels.get(ep.get('position', 'left'), 'Снизу слева')}</code>\n"
+        f"• Позиция: <code>{pos_labels.get(pos_cur, 'Снизу по центру')}</code>\n"
     )
 
     rows: list[list[InlineKeyboardButton]] = []
@@ -2118,7 +2117,23 @@ def build_ep_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     else:
         text += "\nОтправь боту бланк картинкой (фото или PNG/JPG) либо заполни новый через /blank."
 
-    rows.append([InlineKeyboardButton(text="Настроить ЭП", callback_data="ep:edit")])
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=("• Слева" if pos_cur == "left" else "Слева"),
+                callback_data="ep:pos_left",
+            ),
+            InlineKeyboardButton(
+                text=("• По центру" if pos_cur == "center" else "По центру"),
+                callback_data="ep:pos_center",
+            ),
+            InlineKeyboardButton(
+                text=("• Справа" if pos_cur == "right" else "Справа"),
+                callback_data="ep:pos_right",
+            ),
+        ]
+    )
+    rows.append([InlineKeyboardButton(text="Настроить реквизиты ЭП", callback_data="ep:edit")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -2232,7 +2247,7 @@ async def send_signed_blank(message: types.Message, user_id: int, ep_override: d
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="Изменить ЭП и переподписать", callback_data="ep:edit"),
+                    InlineKeyboardButton(text="Изменить ЭП и переподписать", callback_data="ep:menu"),
                 ]
             ]
         )
@@ -2338,12 +2353,12 @@ def apply_ep_step(session: dict, user_id: int, raw_text: str | None, action: str
                 )
 
     elif step == "position":
-        if action == "pos_center" or text.lower() in ("центр", "по центру", "center"):
-            data["position"] = "center"
+        if action == "pos_left" or text.lower() in ("слева", "лево", "left"):
+            data["position"] = "left"
         elif action == "pos_right" or text.lower() in ("справа", "право", "right"):
             data["position"] = "right"
         else:
-            data["position"] = "left"
+            data["position"] = "center"
 
     session["step_idx"] += 1
     return None
@@ -2990,7 +3005,6 @@ async def handle_document(message: types.Message, bot: Bot):
         return
     fname = (doc.file_name or "").lower()
 
-    # Если прислали картинку-бланк документом без сжатия — предлагаем подписать ЭП
     if fname.endswith((".png", ".jpg", ".jpeg", ".webp")):
         try:
             file_info = await bot.get_file(doc.file_id)
@@ -3123,6 +3137,18 @@ async def handle_ep_action(callback: types.CallbackQuery):
         await callback.answer()
         text, kb = build_ep_menu(user_id)
         await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+        return
+
+    if action in ("pos_left", "pos_center", "pos_right"):
+        ep = load_ep_settings()
+        ep["position"] = action.split("_", 1)[1]
+        save_ep_settings(ep)
+        await callback.answer("Позиция обновлена")
+        text, kb = build_ep_menu(user_id)
+        try:
+            await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
         return
 
     if action == "edit":
